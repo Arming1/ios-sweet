@@ -10,8 +10,9 @@ The upstream README, which describes the Redmi Note 10 Pro (`sweet`), is kept un
 
 - 这是 [ios-sweet](https://github.com/dipa-studio/ios-sweet) 向小米 Mi 11（代号 venus，骁龙 888）移植的实验性分支。
 - 目标用户空间与上游相同：未修改的 iOS 16.7.16（20H392，iPhone X 版本）。本仓库不分发任何 Apple 文件。
-- 当前状态：自制引导 shim 可以在手机上运行并在屏幕上输出控制台；XNU 内核还没有在手机上启动。
-- 只使用 `fastboot boot`，从不刷写分区。需要已解锁 Bootloader 的 Mi 11；不要重新上锁。
+- 当前状态（2026-10-24）：XNU 内核（xnu-8796.141.3 + 补丁 0001..0086）已在 Mi 11 上启动，运行未修改的 iOS 16.7.16 用户空间，可以到达锁屏、滑动解锁、进入主屏幕和设置。触摸可用，内核日志可以通过 USB 实时查看。
+- 未完成：按键、Wi-Fi、蓝牙、音频、相机、蜂窝网络、GPU。渲染由 CPU 完成，速度慢。
+- 启动方式：引导镜像只用 `fastboot boot` 启动，从不刷写。iOS 根文件系统（本地构建的 HFS+ 镜像）刷写到 `userdata` 分区，会清除 Android 用户数据，镜像不发布。需要已解锁 Bootloader 的 Mi 11；不要重新上锁。
 - 上游 README 保存在 [README.upstream.md](README.upstream.md)，venus 专用改动见 [VENUS-PORT.md](VENUS-PORT.md)。
 
 ## Status (2026-10-24)
@@ -22,24 +23,56 @@ Confirmed on the phone:
 - PSCI `SYSTEM_RESET` works.
 - The shim draws its console (dark grey background, text) into the scanout buffer.
 - The UFS host answers, and the shim reads the GPT (read-only).
+- XNU (xnu-8796.141.3 + patches 0001..0086) boots on the Mi 11 and runs the unmodified iOS 16.7.16 (20H392) iPhone X userland.
+- The lock screen appears after about 1.5 minutes. The first boot took about 14 minutes (one-time data migration).
+- Swipe-up unlock works. The home screen shows Photos, App Store and Settings; the dock shows Phone, Safari and Messages.
+- Settings works. General > About shows Name iPhone, iOS 16.7.16, Model Name iPhone X, Model/Serial N/A, Capacity 17 GB, Available 4.07 GB.
+- Touch works: multi-touch events, taps, scrolling, and the home gesture from the bottom edge.
+- All 8 CPUs run (`cpus=8`): 4x Cortex-A55, 3x Cortex-A78, 1x Cortex-X1. They are started with PSCI `CPU_ON` and the scheduler treats them as one SMP cluster.
+- Live kernel log over USB (CDC-ECM Ethernet gadget, UDP).
+
+Known problems:
+
+- Slow: rendering is done by the CPU (no GPU driver), and UFS I/O is polled.
+- The first open of Settings > General > About stalls for minutes (`mount_hfs` and a storage scan). Afterwards it is instant.
+- `bluetoothd` and `fairplayd.H2` crash and relaunch continuously (no hardware). `driverkitd` crashes once per boot. PosterBoard (the lock screen poster) occasionally crashes once (signal 5) and is relaunched.
+- The persistent log ring at the end of `userdata` is not written when booting the iOS root (cause unknown).
 
 Not yet:
 
-- The XNU kernel has not booted on the phone.
-- iOS has not run on the Mi 11.
-- No touch, buttons, USB, battery, Wi-Fi, audio or GPU work.
+- Buttons (power and volume), Wi-Fi, Bluetooth, audio, camera, cellular, GPU.
+- Real-time clock: the date shows Wednesday, December 31 1969.
+- Battery level is static.
 
 Next steps:
 
-1. Boot the XNU payload (shim + kernel + Apple Device Tree) and get the kernel log on screen.
-2. Mount the root filesystem on UFS.
+1. Buttons (power and volume).
+2. Faster UFS I/O (currently polled).
+3. Stop the daemons that crash without hardware (`bluetoothd`, `fairplayd.H2`).
+4. Performance work without a GPU driver.
 
 ## How it boots
 
-Only `fastboot boot` is used. The image is never flashed.
+Only `fastboot boot` is used for the boot image. The boot image is never flashed.
 
+- Boot image: Android boot image header v3. The kernel is the shim `Image`; the ramdisk is the payload (kernel + venus Apple Device Tree + command line).
 - The venus bootloader accepts an Android boot image header v3 with the shim as the kernel. The device tree then comes from the phone's own `vendor_boot`.
 - A header v1 image with an appended DTB is rejected with `Failed to load/authenticate boot image: Load Error`. The bootloader then marks the current slot unbootable. Repair it with `fastboot set_active <slot>`.
+- Root filesystem: a 16 GiB HFS+ image built locally from the official iPhone X IPSW with `tools/mkiosroot.sh` (Linux or WSL, `hfsplus` module). It is flashed to the `userdata` partition:
+
+  ```
+  fastboot -S 512M flash userdata ios16-root.simg
+  ```
+
+  This takes about 5-7 minutes and WIPES Android user data. The image is never published (it contains Apple content).
+
+- Current kernel command line (v8):
+
+  ```
+  debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweettouch=1 sweetkeys=0 sweetusb=2
+  ```
+
+- Read-only test variant: the same command line with `ufsrw=0 rootrw=0` instead of `ufsrw=1 rootrw=1`, plus `sweetlog=0 ufsroot=persist`. It does not mount the iOS root and does not write `userdata`. The root mount then fails on purpose; kernel threads such as USB and touch still run.
 
 ## Display
 
@@ -54,14 +87,21 @@ Only `fastboot boot` is used. The image is never flashed.
 | Item | Value on venus |
 | --- | --- |
 | SoC | Qualcomm SM8350 (Snapdragon 888) |
-| CPUs | 4x Cortex-A55, 3x Cortex-A78, 1x Cortex-X1; MPIDR `0x000`-`0x700` |
-| GICD / GICR | `0x17a00000` / `0x17a60000` |
+| CPUs | 4x Cortex-A55, 3x Cortex-A78, 1x Cortex-X1; MPIDR `0x000`-`0x700` (Aff1 = core); all 8 online (`cpus=8`) |
+| GICD / GICR | `0x17a00000` / `0x17a60000` (8 GICR frames) |
 | Virtual / physical timer INTID | 27 / 30 |
 | UFS host | `0x1d84000` |
 | IMEM restart_reason | `0x146bf65c` |
 | Apps watchdog | `0x17c10000` |
 | Kernel RAM (`--highmem`) | `0x1_00000000` + `0xfcc00000` |
 | Framebuffer | `0xE2A00000`, 1440x3200, stride 5760 |
+| USB controller | Synopsys DWC_usb31 v1.10a at `0x0a600000` (GSNPSID `0x33313130`); QSCRATCH `0x0a6f8800`; GDSC `0x10f004` |
+| USB HS PHY | femto PHY at `0x088e3000` (never touched). ABL leaves the controller powered, clocked, in device mode, and halted |
+| Touch | ST FTS (FTM5) on QUP1 SE3 SPI at `0x00a8c000` (CS0, mode 0, 4.8 MHz from XO; SE firmware = SPI, revision `0x102`). Chip id `36 39`; reports 0..1439 x 0..3199. ABL leaves the touch path off |
+| Touch GPIOs | reset GPIO22, IRQ GPIO23 (active low), AVDD enable GPIO132, SPI pins GPIO48-51 (function `qup11`) |
+| Touch power | VDD = PM8350C L2 1.8 V, supplied via RPMh (`ldoc2`) |
+| RPMh | apps RSC DRV 2 at `0x18220000`, TCS offset `0xd00` (same layout as sweet) |
+| SPMI | arbiter v5 at `0x0c440000` (same address as sweet). PM8350C LDOs are RPMh-only and not visible on SPMI |
 
 The apps watchdog block at `0x17c10000` is not accessible from the shim: even a read hangs. It is not armed, so the V60-style disable (`VENUS_WDT_DISABLE`) is off by default.
 
@@ -74,30 +114,48 @@ Some checks need no screen or USB output.
 
 Builds come from `.github/workflows/shim.yml`, with `HEARTBEAT=N` and `EXPERIMENT=N` variants.
 
+**Live kernel log over USB.** With `sweetusb=2` the phone appears as USB device `1209:0001` "Sweet iOS (USB Ethernet)". It is a CDC-ECM Ethernet gadget: the phone is `192.168.7.2`, the host is `192.168.7.1`, and the kernel console streams as UDP to `192.168.7.1:5140`.
+
+Windows host (Windows has no CDC-ECM driver, so the device is passed to WSL2 with usbipd-win):
+
+1. Install usbipd-win: `winget install --exact dorssel.usbipd-win`.
+2. Once, as administrator: `usbipd policy add --effect Allow --operation AutoBind --hardware-id 1209:0001`.
+3. When the device appears, attach it: `usbipd attach --wsl --busid <id> --auto-attach`.
+4. In WSL2 (kernel modules `vhci-hcd` and `cdc_ether`), give the interface `192.168.7.1/24` and receive the UDP stream with `socat`.
+
+On Linux hosts, `tools/sweet-usbnet.sh` does steps 3 and 4.
+
 ## Safety
 
 - Experimental. Do not use it as a daily phone.
+- Boot images are started only with `fastboot boot`. Never flash `boot`, `vbmeta` or `dtbo`.
+- Only `userdata` is flashed, with the iOS root. This erases Android's `userdata` partition. Kernels that write the root need `ufsrw=1 rootrw=1`; all other experiments use read-only boot arguments.
 - Never relock the bootloader.
-- A full install would erase Android's `userdata` partition. This has not been done.
 - Requires an already-unlocked Mi 11.
 
 ## Building
 
 ### Kernel (xnu)
 
-`.github/workflows/xnu.yml` builds xnu-8796.141.3 on GitHub's macOS runner, with all 81 patches in `xnu/patches` applied. The venus changes only change numbers and addresses in existing patches. See [VENUS-PORT.md](VENUS-PORT.md).
+`.github/workflows/xnu.yml` builds xnu-8796.141.3 on GitHub's macOS runner, with all 86 patches in `xnu/patches` applied (0001-0086). The venus changes are patches 0082-0086. See [VENUS-PORT.md](VENUS-PORT.md).
 
 ### Shim
 
 `.github/workflows/shim.yml` builds the shim `Image` (plus the `HEARTBEAT` / `EXPERIMENT` variants). The `fastboot boot` image is packed separately as an Android boot image header v3: the shim `Image` is the kernel, and the ramdisk is either empty (diagnostics only) or the XNU payload made by `tools/mkadt.py` and `tools/mkpayload.py`. The shim finds the payload behind the phone's own vendor ramdisk.
+
+The shim experiments are read-only probes, built with `EXPERIMENT=10`, `11` or `12`:
+
+- 10 = U1 USB (GCC, DWC3, QSCRATCH).
+- 11 = T1 touch (TLMM GPIO 22/23/132, QUP1 clocks, SE3).
+- 12 = T2 (QUP1 clock vote, SE3 firmware revision, PMIC L2 over SPMI).
 
 ## Repository layout
 
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm) |
-| `xnu/patches/` | The 81 XNU patches, applied in order by CI |
-| `tools/` | Host tools, e.g. `mkadt.py` (Apple Device Tree) and `mkpayload.py` (kernel + ADT payload) |
+| `xnu/patches/` | The 86 XNU patches (0001-0086), applied in order by CI |
+| `tools/` | Host tools, e.g. `mkadt.py` (Apple Device Tree), `mkpayload.py` (kernel + ADT payload), `mkiosroot.sh` (iOS root image) and `sweet-usbnet.sh` (USB Ethernet on Linux) |
 | `.github/workflows/xnu.yml` | Kernel build |
 | `.github/workflows/shim.yml` | Shim build, including the `HEARTBEAT` and `EXPERIMENT` variants |
 | `VENUS-PORT.md` | venus-specific changes and their verification status |

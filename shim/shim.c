@@ -152,6 +152,8 @@ static void __attribute__((noreturn)) hb_report(unsigned n)
  *         and report its top nibble. A hang means the MDP is unclocked.
  * 10 (U1): read-only USB probe (GCC power/clocks, DWC3, QSCRATCH), shown on screen.
  *          No register writes, never resets; the last line on screen names a hung read.
+ * 11 (T1): read-only touch probe (TLMM GPIO 22/23/132, GCC QUP1 clocks, SE3 SPI engine).
+ * 12 (T2): QUP1/SE3 clock vote (the only GCC write), SE3 read-back, PM8350C L2 status via SPMI observer reads.
  */
 #ifndef EXPERIMENT
 #define EXPERIMENT 0
@@ -319,12 +321,205 @@ static void __attribute__((noreturn)) usb_u1_probe(void)
 		__asm__ volatile("wfe");
 }
 
+/*
+ * T1 (-DEXPERIMENT=11): read-only touch probe. No writes at all. Same rules as U1:
+ * each pair is named before it is read, so a hang leaves that line last.
+ */
+#define TLMM_BASE		0x0f100000UL
+#define SE3_BASE		0x00a8c000UL
+
+static const struct u1_reg t1_tlmm[] = {	/* GPIO n: CTL at n * 0x1000, IN_OUT at CTL + 4 */
+	{ "G22CTL", TLMM_BASE + 22 * 0x1000 },
+	{ "G22IO", TLMM_BASE + 22 * 0x1000 + 4 },
+	{ "G23CTL", TLMM_BASE + 23 * 0x1000 },
+	{ "G23IO", TLMM_BASE + 23 * 0x1000 + 4 },
+	{ "G132CTL", TLMM_BASE + 132 * 0x1000 },
+	{ "G132IO", TLMM_BASE + 132 * 0x1000 + 4 },
+};
+
+static const struct u1_reg t1_gcc[] = {	/* CBCRs bit31 = CLK_OFF; VOTE bits 18/19/20/21/25 are the QUP1 branch enables */
+	{ "VOTE", GCC_BASE + 0x52008 },
+	{ "S3CBCR", GCC_BASE + 0x1839c },
+	{ "CORE", GCC_BASE + 0x23138 },
+	{ "CORE2X", GCC_BASE + 0x23140 },
+	{ "MAHB", GCC_BASE + 0x18004 },
+	{ "SAHB", GCC_BASE + 0x18008 },
+};
+
+static const struct u1_reg t1_se3[] = {	/* GENI / SE register offsets from the QUP SE register map */
+	{ "STATUS", SE3_BASE + 0x40 },
+	{ "MCLKCFG", SE3_BASE + 0x48 },
+	{ "FWREV", SE3_BASE + 0x68 },
+	{ "DMAEN", SE3_BASE + 0x258 },
+	{ "MIRQ", SE3_BASE + 0x610 },
+	{ "TXFIFO", SE3_BASE + 0x800 },
+	{ "RXFIFO", SE3_BASE + 0x804 },
+	{ "HWPAR0", SE3_BASE + 0xe24 },
+};
+
+static void __attribute__((noreturn)) touch_t1_probe(void)
+{
+	uint32_t tv[sizeof(t1_tlmm) / sizeof(t1_tlmm[0])];
+	uint32_t gv[sizeof(t1_gcc) / sizeof(t1_gcc[0])];
+	uint32_t sv[sizeof(t1_se3) / sizeof(t1_se3[0])];
+
+	con_clear(DARKGREY);
+	con_str("TCH", "t1 read-only touch probe, no writes");
+	u1_group("TLMM", t1_tlmm, sizeof(t1_tlmm) / sizeof(t1_tlmm[0]), tv);
+	u1_group("GCC", t1_gcc, sizeof(t1_gcc) / sizeof(t1_gcc[0]), gv);
+	/*
+	 * SE3 is only safe to touch with the QUP1 clocks running. MAHB/SAHB
+	 * (0x18004/0x18008) are not confirmed for lahaina, so also require the
+	 * apps votes (0x52008 bits 18-21, 25) and core/core2x CLK_OFF clear.
+	 */
+	uint32_t want = (0xfu << 18) | (1u << 25);
+	if ((gv[0] & want) == want && !(gv[1] >> 31) && !(gv[2] >> 31) &&
+	    !(gv[3] >> 31) && !(gv[4] >> 31) && !(gv[5] >> 31)) {
+		con_str("TCH", "next: SE3");
+		u1_group("SE3", t1_se3, sizeof(t1_se3) / sizeof(t1_se3[0]), sv);
+	} else {
+		con_str("TCH", "gated: SE3 not read");
+	}
+	con_str("TCH", "done. hold Power 15s, then Power+VolDown");
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+/*
+ * T2 (-DEXPERIMENT=12): the one GCC write (QUP1 clock vote), then PM8350C LDO2
+ * status over the SPMI observer (read commands only). Same screen rules as U1/T1.
+ */
+#define SPMI_CORE		0x0c440000UL	/* SPMI arbiter v5 (physical) */
+#define SPMI_OBS		0x0e600000UL
+#define SPMI_CFG		0x0c40a000UL
+#define T2_PPID			0x241		/* SID 2, peripheral 0x41 = PM8350C LDO2 */
+
+/* One 1-byte register read through observer channel apid; 0 ok, -1 bus error, -2 timeout. */
+static int t2_spmi_read(unsigned apid, unsigned reg, uint8_t *out)
+{
+	uintptr_t ch = SPMI_OBS + 0x80 * apid;
+	uint64_t step = rsr("cntfrq_el0") / 25000;	/* 40 us per poll, 1000 polls */
+
+	wr32(ch + 0x0, (1u << 27) | ((reg & 0xff) << 4));	/* EXT_READL, byte count 0 = 1 byte */
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (int i = 0; i < 1000; i++) {
+		uint32_t st = rd32(ch + 0x08);
+		if (st & 1) {
+			if (st & 0x0e)
+				return -1;
+			*out = rd32(ch + 0x18) & 0xff;
+			return 0;
+		}
+		uint64_t end = now() + step;
+		while (now() < end)
+			;
+	}
+	return -2;
+}
+
+/* APID whose PPID map entry is 0x241 (owner 0 preferred), or -1. */
+static int t2_find_apid(uint32_t cnt)
+{
+	int apid = -1;
+
+	for (uint32_t i = 0; i < cnt; i++) {
+		uint32_t map = rd32(SPMI_CORE + 0x900 + 4 * i);
+		if (map != 0 && ((map >> 8) & 0xfff) == T2_PPID) {
+			uint32_t owner = rd32(SPMI_CFG + 0x700 + 4 * i) & 7;
+			if (apid < 0 || owner == 0)
+				apid = (int)i;
+		}
+	}
+	return apid;
+}
+
+/* Read one LDO2 register and print it; an error shows as 0xe0xx (xx = -rc). */
+static uint32_t t2_l2_show(const char *label, unsigned apid, unsigned reg)
+{
+	uint8_t v = 0;
+	int rc;
+
+	con_hex("L2next", reg);
+	rc = t2_spmi_read(apid, reg, &v);
+	uint32_t val = rc ? 0xe000u | (unsigned)-rc : v;
+	con_hex(label, val);
+	return val;
+}
+
+static void t2_pmic_l2(void)
+{
+	con_str("TCH", "next: SPMI core");
+	uint32_t ver = rd32(SPMI_CORE + 0x0);
+	uint32_t cnt = rd32(SPMI_CORE + 0x4) & 0x7ff;
+	con_hex2("SPMI", "ver=", ver, "cnt=", cnt);
+	if (ver < 0x50000000U || ver >= 0x70000000U || cnt == 0 || cnt > 512) {
+		con_str("SPMI", "SPMI: unsupported");
+		return;
+	}
+	int apid = t2_find_apid(cnt);
+	if (apid < 0) {
+		con_str("SPMI", "SPMI: no APID for 0x241");
+		return;
+	}
+	con_hex("APID", apid);
+	t2_l2_show("L2 r04", apid, 0x04);	/* PERPH_TYPE */
+	t2_l2_show("L2 r05", apid, 0x05);	/* SUBTYPE */
+	t2_l2_show("L2 r08", apid, 0x08);	/* STATUS1, bit7 VREG_READY */
+	uint32_t lb = t2_l2_show("L2 r40", apid, 0x40);	/* VSET_LB */
+	uint32_t ub = t2_l2_show("L2 r41", apid, 0x41);	/* VSET_UB */
+	if (!((lb | ub) & 0xff00))
+		con_hex("L2 mV", lb | (ub << 8));
+	t2_l2_show("L2 r45", apid, 0x45);	/* MODE */
+	t2_l2_show("L2 r46", apid, 0x46);	/* EN_CTL, bit7 enable */
+}
+
+/*
+ * T2: the only GCC write is the QUP1 clock vote; everything else is a read,
+ * except the one SPMI read command per register. Each line is named before it runs.
+ */
+static void __attribute__((noreturn)) touch_t2_probe(void)
+{
+	uint32_t gv[sizeof(t1_gcc) / sizeof(t1_gcc[0])];
+	uint32_t sv[sizeof(t1_se3) / sizeof(t1_se3[0])];
+	uint32_t want = (0xfu << 18) | (1u << 25);
+	int i;
+
+	con_clear(DARKGREY);
+	con_str("TCH", "t2: QUP1 clock vote + PMIC L2 read");
+	u1_group("GCC", t1_gcc, sizeof(t1_gcc) / sizeof(t1_gcc[0]), gv);
+	con_str("TCH", "write: vote |= 0x023c0000");
+	wr32(GCC_BASE + 0x52008, rd32(GCC_BASE + 0x52008) | want);
+	__asm__ volatile("dsb sy" ::: "memory");
+	for (i = 0; i < 20; i++) {
+		if (!(rd32(GCC_BASE + 0x1839c) >> 31) && !(rd32(GCC_BASE + 0x23138) >> 31) &&
+		    !(rd32(GCC_BASE + 0x23140) >> 31))
+			break;
+		delay_ms(1);
+	}
+	con_hex("polls", i);
+	u1_group("GCC", t1_gcc, sizeof(t1_gcc) / sizeof(t1_gcc[0]), gv);
+	if ((gv[0] & want) == want && !(gv[1] >> 31) && !(gv[2] >> 31) && !(gv[3] >> 31)) {
+		con_str("TCH", "next: SE3");
+		u1_group("SE3", t1_se3, sizeof(t1_se3) / sizeof(t1_se3[0]), sv);
+	} else {
+		con_str("TCH", "clocks did not start: SE3 not read");
+	}
+	t2_pmic_l2();
+	con_str("TCH", "done. hold Power 15s, then Power+VolDown");
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 static void run_experiment(void)
 {
 	if (EXPERIMENT >= 100 && EXPERIMENT < 116)
 		hb_report(EXPERIMENT - 100);
 	if (EXPERIMENT == 10)
 		usb_u1_probe();
+	if (EXPERIMENT == 11)
+		touch_t1_probe();
+	if (EXPERIMENT == 12)
+		touch_t2_probe();
 	if (EXPERIMENT == 1) {
 		uint32_t v = rd32(MDSS_BASE);
 		__asm__ volatile("dsb sy" ::: "memory");
