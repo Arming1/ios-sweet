@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_BASE		0xea600000UL	/* venus: reserved-memory splash_region */
+#define FB_BASE		0xe2a00000UL	/* venus: measured scanout buffer (VIG0) */
 #define FB_W		1440
 #define FB_H		3200
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */

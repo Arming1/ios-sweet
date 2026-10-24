@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0xea600000UL
+#define FB_PHYS	0xe2a00000UL
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;

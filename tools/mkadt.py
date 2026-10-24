@@ -22,7 +22,7 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-FB, FB_SIZE = 0xea600000, 0x2300000   # venus: reserved-memory splash_region
+FB, FB_SIZE = 0xe2a00000, 0x2300000   # venus: measured scanout buffer (VIG0), reserved e2a00000-e4cfffff
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1440, 3200, 1440 * 4   # venus K2 panel
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none

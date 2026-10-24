@@ -286,6 +286,26 @@ static void run_experiment(void)
 	 * touches no display register; D6 also rewrites autorefresh (same value
 	 * as D4) but never kicks CTL_START, to tell the two writes apart.
 	 */
+	if (EXPERIMENT == 8 || EXPERIMENT == 9) {	/* D7 = 8, D8 = 9: the two pipes of the src-split */
+		int p0 = -1, p1 = -1;
+		for (int i = 0; i < 8; i++)
+			if (mdp_rd(sspp_off[i] + SSPP_SRC_SIZE)) {
+				if (p0 < 0)
+					p0 = i;
+				else if (p1 < 0)
+					p1 = i;
+			}
+		if (EXPERIMENT == 8)
+			hb_report(p1 >= 0 ? p1 : 15);	/* index of the second active pipe, 15 = none */
+		if (p0 < 0 || p1 < 0)
+			hb_report(15);
+		uint32_t a0 = mdp_rd(sspp_off[p0] + SSPP_SRC0_ADDR), a1 = mdp_rd(sspp_off[p1] + SSPP_SRC0_ADDR);
+		uint32_t n = (a1 == a0);				/* bit0: same buffer address */
+		n |= (a1 == a0 + (FB_W / 2) * 4) << 1;			/* bit1: second pipe starts at the right half */
+		n |= ((mdp_rd(sspp_off[p0] + SSPP_SRC_YSTRIDE0) & 0xffff) == FB_W * 4) << 2;	/* bit2: stride 5760 */
+		n |= ((mdp_rd(sspp_off[p0] + SSPP_SRC_SIZE) & 0xffff) == FB_W / 2) << 3;	/* bit3: pipe 0 is 720 wide */
+		hb_report(n);
+	}
 	if (EXPERIMENT == 6 || EXPERIMENT == 7) {	/* D5 = 6, D6 = 7 */
 		unsigned painted = paint_active_pipes();
 		uint32_t ar = mdp_rd(0x36000 + INTF_AUTOREFRESH);

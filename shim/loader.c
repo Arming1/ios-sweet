@@ -76,6 +76,33 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/*
+ * venus boots a header v3 image: ABL places the vendor_boot ramdisk
+ * (0x13ec794 bytes on this phone, not a multiple of 8) in front of ours, so
+ * the payload is somewhere inside the initrd and may be misaligned. Find the
+ * magic with byte reads, then slide the payload down to an 8-byte boundary
+ * with byte copies: the MMU is off, so unaligned 64-bit loads would fault.
+ * Returns the aligned payload start and updates *end, or 0.
+ */
+static uint64_t find_payload(uint64_t start, uint64_t *end)
+{
+	uint64_t at = 0;
+	for (uint64_t a = start; a + 8 <= *end; a++)
+		if (magic_ok((const char *)a)) {
+			at = a;
+			break;
+		}
+	if (!at || !(at & 7))
+		return at;
+	uint64_t dst = at & ~7UL;
+	volatile uint8_t *d = (volatile uint8_t *)dst;
+	const volatile uint8_t *s = (const volatile uint8_t *)at;
+	for (uint64_t i = 0; i < *end - at; i++)	/* dst < src: ascending copy is overlap-safe */
+		d[i] = s[i];
+	*end -= at - dst;
+	return dst;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
@@ -84,6 +111,12 @@ const char *loader_boot(uintptr_t dtb)
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
+
+	uint64_t pl = find_payload(rd_start, &rd_end);
+	if (!pl)
+		return "no SWEETXNU payload";
+	con_hex2("PAYLOAD", "at=", pl, "skipped=", pl - rd_start);
+	rd_start = pl;
 
 	const struct payload *p = (const struct payload *)rd_start;
 	if (!magic_ok(p->magic))
