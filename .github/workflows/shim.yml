@@ -58,6 +58,11 @@ jobs:
             EXTRA_CFLAGS="-DHEARTBEAT=$n" ./_ci_build_part.sh > /dev/null
             cp out/Image "hb/Image-hb$n"
           done
+          # display experiments and timed-heartbeat calibration (notes/display-analysis.md)
+          for spec in d1:1 cal0:100 cal5:105; do
+            EXTRA_CFLAGS="-DEXPERIMENT=${spec#*:}" ./_ci_build_part.sh > /dev/null
+            cp out/Image "hb/Image-${spec%%:*}"
+          done
           # rebuild the normal Image last so the shim-image artifact stays the plain build
           ./_ci_build_part.sh > /dev/null
           sha256sum out/Image hb/*

@@ -134,6 +134,38 @@ static void __attribute__((noreturn)) hb_reset(void)
 }
 #define HB(n) do { if (HEARTBEAT == (n)) hb_reset(); } while (0)
 
+/*
+ * Timed heartbeat: report a 4-bit value with no screen or USB by waiting
+ * 2 + 2*n seconds before the reboot. The host measures boot -> Android
+ * (tools/run-heartbeat.sh) and subtracts the calibrated baseline.
+ */
+static void __attribute__((noreturn)) hb_report(unsigned n)
+{
+	delay_ms((2 + 2 * (n & 0xf)) * 1000);
+	hb_reset();
+}
+
+/*
+ * venus display experiments (-DEXPERIMENT=N), see notes/display-analysis.md.
+ * 100+k: timing calibration, reports the constant k.
+ * 1 (D1): read MDSS HW_VERSION at 0xae00000 (SDE 7.0 on SM8350 -> 0x7xxxxxxx)
+ *         and report its top nibble. A hang means the MDP is unclocked.
+ */
+#ifndef EXPERIMENT
+#define EXPERIMENT 0
+#endif
+#define MDSS_BASE		0x0ae00000UL
+static void run_experiment(void)
+{
+	if (EXPERIMENT >= 100 && EXPERIMENT < 116)
+		hb_report(EXPERIMENT - 100);
+	if (EXPERIMENT == 1) {
+		uint32_t v = rd32(MDSS_BASE);
+		__asm__ volatile("dsb sy" ::: "memory");
+		hb_report(v >> 28);
+	}
+}
+
 /* ---- exceptions ---- */
 
 static void irq_handler(void)
@@ -414,6 +446,8 @@ void shim_main(uint64_t dtb)
 	__asm__ volatile("dsb sy" ::: "memory");
 #endif
 	HB(3);	/* shim_main past the (disabled) watchdog block */
+	if (EXPERIMENT)
+		run_experiment();	/* never returns for a defined experiment */
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
