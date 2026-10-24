@@ -1,0 +1,62 @@
+# Builds only the shim Image on GitHub; the boot.img is packed locally with the local DTB (tools/mkbootimg_v1.py).
+# Builds the venus bare-metal shim (compile, link, objcopy, truncate, host render).
+# Packing into boot.img is intentionally NOT done here: the DTB stays local and
+# mkbootimg_v1.py is run on the Windows side with the local DTB.
+name: shim-image
+
+on:
+  workflow_dispatch:
+  # workflow_dispatch only works from the default branch, so also build on pushes to the venus branch
+  push:
+    branches: [venus-ios16-build]
+    paths: ['shim/**', '.github/workflows/shim.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build-shim:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shim
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install AArch64 cross toolchain and cpio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu cpio gzip gawk  # build.sh uses gawk strtonum
+
+      - name: Derive compile/link part of build.sh (everything before mkbootimg)
+        # build.sh has the mkbootimg call at a fixed "mkbootimg " line; keep only the lines above it
+        # so the CI compile is exactly the local compile and the DTB is never referenced.
+        run: |
+          grep -q '^mkbootimg ' build.sh
+          sed '/^mkbootimg /,$d' build.sh > _ci_build_part.sh
+          chmod +x _ci_build_part.sh
+          cat _ci_build_part.sh
+
+      - name: Compile, link, objcopy, truncate
+        run: ./_ci_build_part.sh
+
+      - name: Host render test
+        run: |
+          gcc -O1 -Wall -o out/host_test console.c host_test.c
+          ./out/host_test
+
+      - name: Show outputs
+        run: |
+          ls -l out/Image out/shim.elf
+          sha256sum out/Image out/shim.elf
+
+      - name: Upload shim-image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-image
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            shim/out/Image
+            shim/out/shim.elf
