@@ -217,6 +217,20 @@ static int paint(uint64_t pa, uint32_t stride, uint32_t rows)
 	return 1;
 }
 
+/* Paint every SSPP that ABL left fetching; returns how many buffers were painted. */
+static unsigned paint_active_pipes(void)
+{
+	unsigned painted = 0;
+	for (int i = 0; i < 8; i++) {
+		uint32_t size = mdp_rd(sspp_off[i] + SSPP_SRC_SIZE);
+		if (!size)
+			continue;
+		painted += paint(mdp_rd(sspp_off[i] + SSPP_SRC0_ADDR),
+				 mdp_rd(sspp_off[i] + SSPP_SRC_YSTRIDE0) & 0xffff, size >> 16);
+	}
+	return painted;
+}
+
 static void run_experiment(void)
 {
 	if (EXPERIMENT >= 100 && EXPERIMENT < 116)
@@ -248,17 +262,10 @@ static void run_experiment(void)
 		int a = active_pipe();
 		if (a < 0)
 			hb_report(15);
-		hb_report(mdp_rd(sspp_off[a] + SSPP_SRC0_ADDR) >> (4 * (EXPERIMENT - 20)));
+		hb_report(mdp_rd(sspp_off[a] + SSPP_SRC0_ADDR) >> (4 * ((EXPERIMENT - 20) & 7)));
 	}
 	if (EXPERIMENT == 4) {	/* D4: paint (blue) every active pipe's buffer + the DT splash, then kick INTF_1 */
-		unsigned painted = 0;
-		for (int i = 0; i < 8; i++) {
-			uint32_t size = mdp_rd(sspp_off[i] + SSPP_SRC_SIZE);
-			if (!size)
-				continue;
-			painted += paint(mdp_rd(sspp_off[i] + SSPP_SRC0_ADDR),
-					 mdp_rd(sspp_off[i] + SSPP_SRC_YSTRIDE0) & 0xffff, size >> 16);
-		}
+		unsigned painted = paint_active_pipes();
 		paint(VENUS_SPLASH, FB_W * 4, FB_H);
 		int c = intf1_ctl();
 		if (c >= 0) {
@@ -272,6 +279,23 @@ static void run_experiment(void)
 			delay_ms(1000);
 		}
 		hb_report((painted & 7) | ((c >= 0) << 3));	/* bits 0-2: buffers painted, bit 3: CTL found */
+	}
+	/*
+	 * D4 showed blue for ~2 s, then DSC noise: ABL already leaves INTF_1
+	 * autorefresh on, and our CTL_START kicks raced it. D5 only paints and
+	 * touches no display register; D6 also rewrites autorefresh (same value
+	 * as D4) but never kicks CTL_START, to tell the two writes apart.
+	 */
+	if (EXPERIMENT == 6 || EXPERIMENT == 7) {	/* D5 = 6, D6 = 7 */
+		unsigned painted = paint_active_pipes();
+		uint32_t ar = mdp_rd(0x36000 + INTF_AUTOREFRESH);
+		if (EXPERIMENT == 7) {
+			wr32(INTF1_BASE + INTF_AUTOREFRESH, (1u << 31) | 1);
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+		delay_ms(30000);	/* hold for a human to watch / film the panel */
+		/* bits 0-2: buffers painted; bit 3: ABL's autorefresh frame count was 1 */
+		hb_report((painted & 7) | (((ar & 0xffff) == 1) << 3));
 	}
 }
 
