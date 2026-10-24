@@ -604,7 +604,7 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(RED);
+	con_clear(DARKGREY);
 	HB(4);	/* framebuffer written */
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
@@ -624,17 +624,17 @@ void shim_main(uint64_t dtb)
 	reset(20);
 
 	stage = "fill off";
-	uint64_t fill_off = ticks_fill(RED);
+	uint64_t fill_off = ticks_fill(DARKGREY);
 	uint64_t mem_off = ticks_mem();
 
 	stage = "mmu enable";
 	int rc = mmu_enable(&mi);
 
 	stage = "fill on";
-	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
+	uint64_t fill_on = rc ? 0 : ticks_fill(DARKGREY);
 	uint64_t mem_on = rc ? 0 : ticks_mem();
 	if (rc)
-		con_clear(RED);
+		con_clear(DARKGREY);
 
 	con_str("SHIM", "sweet milestone 3");
 	con_skip();
