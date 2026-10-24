@@ -115,6 +115,25 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 		__asm__ volatile("wfe");
 }
 
+/*
+ * venus heartbeat builds (-DHEARTBEAT=N): reboot straight to fastboot at
+ * checkpoint N, with no delay and no console output. The phone returning
+ * to fastboot proves the shim got that far (no screen or USB needed).
+ */
+#ifndef HEARTBEAT
+#define HEARTBEAT 0
+#endif
+static void __attribute__((noreturn)) hb_reset(void)
+{
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+	wr32(PSHOLD, 0);
+	for (;;)
+		__asm__ volatile("wfe");
+}
+#define HB(n) do { if (HEARTBEAT == (n)) hb_reset(); } while (0)
+
 /* ---- exceptions ---- */
 
 static void irq_handler(void)
@@ -375,22 +394,28 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+	HB(2);	/* entered shim_main */
+
 	/* venus: disable the apps watchdog ABL leaves armed (V60 did the same; unverified here). */
 	wr32(WDT_BASE + 0x08, 0);
 	__asm__ volatile("dsb sy" ::: "memory");
+	HB(3);	/* watchdog disabled */
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
+	HB(4);	/* framebuffer written */
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+	HB(5);	/* loader returned (no payload) */
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
 	test_ufs();
+	HB(6);	/* UFS probe returned */
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");

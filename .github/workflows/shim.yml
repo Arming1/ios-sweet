@@ -51,6 +51,25 @@ jobs:
           ls -l out/Image out/shim.elf
           sha256sum out/Image out/shim.elf
 
+      - name: Heartbeat variants (reboot to fastboot at checkpoint N)
+        run: |
+          mkdir -p hb
+          for n in 1 2 3 4 5 6; do
+            EXTRA_CFLAGS="-DHEARTBEAT=$n" ./_ci_build_part.sh > /dev/null
+            cp out/Image "hb/Image-hb$n"
+          done
+          # rebuild the normal Image last so the shim-image artifact stays the plain build
+          ./_ci_build_part.sh > /dev/null
+          sha256sum out/Image hb/*
+
+      - name: Upload heartbeat artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-heartbeat
+          if-no-files-found: error
+          retention-days: 14
+          path: shim/hb/
+
       - name: Upload shim-image artifact
         uses: actions/upload-artifact@v4
         with:

@@ -20,6 +20,21 @@ _head:
 	.globl _start
 _start:
 	msr	daifset, #0xf
+#if defined(HEARTBEAT) && HEARTBEAT == 1
+	/* venus heartbeat 1: first instruction, before stack/vectors/.bss.
+	 * restart_reason = bootloader, then PSCI SYSTEM_RESET, then PSHOLD. */
+	ldr	x1, =0x146bf65c
+	ldr	w2, =0x77665500
+	str	w2, [x1]
+	dsb	sy
+	ldr	x0, =0x84000009
+	smc	#0
+	ldr	x1, =0x0c264000
+	str	wzr, [x1]
+9:	wfe
+	b	9b
+	.ltorg
+#endif
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
 	adr	x1, _stack_top
