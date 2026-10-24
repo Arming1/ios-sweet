@@ -155,6 +155,68 @@ static void __attribute__((noreturn)) hb_report(unsigned n)
 #define EXPERIMENT 0
 #endif
 #define MDSS_BASE		0x0ae00000UL
+/* Offsets from the venus DT (qcom,sde-*-off) and techpack/display/msm/sde/sde_hw_*.c */
+static const uint32_t sspp_off[8] = {	/* VIG0..3, DMA0..3 */
+	0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000,
+};
+#define SSPP_SRC_SIZE		0x00	/* (h << 16) | w */
+#define SSPP_SRC0_ADDR		0x14
+#define SSPP_SRC_YSTRIDE0	0x24	/* plane 0 stride in the low 16 bits */
+#define CTL_OFF(i)		(0x16000 + 0x1000 * (i))	/* CTL_0..5 */
+#define CTL_START		0x01c
+#define CTL_INTF_ACTIVE		0x0f4
+#define INTF1_BASE		(MDSS_BASE + 0x36000)	/* INTF_1 = DSI0, TE lives here on SDE 7 */
+#define INTF_TIMING_ENGINE_EN	0x000
+#define INTF_TEAR_CHECK_EN	0x284
+#define INTF_AUTOREFRESH	0x2b4	/* BIT31 enable, low 16 bits frame count */
+#define VENUS_SPLASH		0xea600000UL
+
+static inline uint32_t mdp_rd(uint32_t off) { return rd32(MDSS_BASE + off); }
+
+/* First SSPP whose SRC_SIZE is non-zero (the pipe ABL left fetching), or -1. */
+static int active_pipe(void)
+{
+	for (int i = 0; i < 8; i++)
+		if (mdp_rd(sspp_off[i] + SSPP_SRC_SIZE))
+			return i;
+	return -1;
+}
+
+/* CTL whose INTF_ACTIVE has INTF_1 (bit 1) set, or -1. */
+static int intf1_ctl(void)
+{
+	for (int i = 0; i < 6; i++)
+		if (mdp_rd(CTL_OFF(i) + CTL_INTF_ACTIVE) & (1u << 1))
+			return i;
+	return -1;
+}
+
+extern char _head[], _end[];	/* our own image (start.S / shim.ld) */
+/*
+ * D4 fill colour: pure blue as 32-bit 0xAARRGGBB. Seeing blue means the pipe
+ * fetches ARGB; seeing red means R and B are swapped (ABGR). Either way the
+ * panel refreshed.
+ */
+#define PAINT_COLOR		0xff0000ffU
+
+/*
+ * Fill a scanout buffer with PAINT_COLOR if it looks like ordinary RAM, is not huge
+ * and does not overlap the shim itself (ABL chose our load address).
+ */
+static int paint(uint64_t pa, uint32_t stride, uint32_t rows)
+{
+	uint64_t len = (uint64_t)stride * rows;
+	uint64_t lo = (uintptr_t)_head, hi = (uintptr_t)_end + 0x10000;	/* + stack slack */
+	if (pa < 0x80000000UL || pa + len > 0x280000000UL || len == 0 || len > 0x4000000)
+		return 0;
+	if (pa < hi && lo < pa + len)
+		return 0;
+	for (uint64_t o = 0; o < len; o += 4)
+		wr32(pa + o, PAINT_COLOR);
+	__asm__ volatile("dsb sy" ::: "memory");
+	return 1;
+}
+
 static void run_experiment(void)
 {
 	if (EXPERIMENT >= 100 && EXPERIMENT < 116)
@@ -163,6 +225,53 @@ static void run_experiment(void)
 		uint32_t v = rd32(MDSS_BASE);
 		__asm__ volatile("dsb sy" ::: "memory");
 		hb_report(v >> 28);
+	}
+	if (EXPERIMENT == 2) {	/* D2: which pipe scans the DT splash buffer? */
+		for (int i = 0; i < 8; i++)
+			if (mdp_rd(sspp_off[i] + SSPP_SRC0_ADDR) == (uint32_t)VENUS_SPLASH)
+				hb_report(i);		/* 0..7: pipe i scans 0xea600000 */
+		int a = active_pipe();
+		hb_report(a >= 0 && a < 7 ? 8 + a : 15);	/* 8..14: pipe a active elsewhere; 15: none (or only DMA3) */
+	}
+	if (EXPERIMENT == 3) {	/* D3: INTF_1 state */
+		uint32_t n = (mdp_rd(0x36000 + INTF_AUTOREFRESH) >> 31) & 1;
+		n |= (mdp_rd(0x36000 + INTF_TEAR_CHECK_EN) & 1) << 1;
+		n |= (mdp_rd(0x36000 + INTF_TIMING_ENGINE_EN) & 1) << 2;
+		n |= (intf1_ctl() >= 0) << 3;
+		hb_report(n);	/* bit0 autorefresh, bit1 tear check, bit2 timing engine, bit3 a CTL drives INTF_1 */
+	}
+	if (EXPERIMENT == 5) {	/* D3b: which CTL drives INTF_1 */
+		int c = intf1_ctl();
+		hb_report(c >= 0 ? c : 15);
+	}
+	if (EXPERIMENT >= 20 && EXPERIMENT < 28) {	/* address readout: nibble k of the active pipe's SRC0_ADDR */
+		int a = active_pipe();
+		if (a < 0)
+			hb_report(15);
+		hb_report(mdp_rd(sspp_off[a] + SSPP_SRC0_ADDR) >> (4 * (EXPERIMENT - 20)));
+	}
+	if (EXPERIMENT == 4) {	/* D4: paint (blue) every active pipe's buffer + the DT splash, then kick INTF_1 */
+		unsigned painted = 0;
+		for (int i = 0; i < 8; i++) {
+			uint32_t size = mdp_rd(sspp_off[i] + SSPP_SRC_SIZE);
+			if (!size)
+				continue;
+			painted += paint(mdp_rd(sspp_off[i] + SSPP_SRC0_ADDR),
+					 mdp_rd(sspp_off[i] + SSPP_SRC_YSTRIDE0) & 0xffff, size >> 16);
+		}
+		paint(VENUS_SPLASH, FB_W * 4, FB_H);
+		int c = intf1_ctl();
+		if (c >= 0) {
+			wr32(INTF1_BASE + INTF_AUTOREFRESH, (1u << 31) | 1);
+			__asm__ volatile("dsb sy" ::: "memory");
+		}
+		/* Hold ~30 s for a human to look at the panel; re-kick once a second. */
+		for (int t = 0; t < 30; t++) {
+			if (c >= 0)
+				wr32(MDSS_BASE + CTL_OFF(c) + CTL_START, 1);
+			delay_ms(1000);
+		}
+		hb_report((painted & 7) | ((c >= 0) << 3));	/* bits 0-2: buffers painted, bit 3: CTL found */
 	}
 }
 
