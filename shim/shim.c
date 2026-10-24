@@ -396,10 +396,24 @@ void shim_main(uint64_t dtb)
 
 	HB(2);	/* entered shim_main */
 
-	/* venus: disable the apps watchdog ABL leaves armed (V60 did the same; unverified here). */
+	/* HB 7 probe: is the apps WDT enable register (WDT_BASE + 0x08) even readable? */
+	if (HEARTBEAT == 7) {
+		volatile uint32_t v = rd32(WDT_BASE + 0x08);
+		(void)v;
+		__asm__ volatile("dsb sy" ::: "memory");
+		hb_reset();
+	}
+
+	/*
+	 * venus: the apps watchdog disable (copied from the V60 port) HUNG the
+	 * shim on this phone (heartbeat hb3, 2026-10-24). Off by default;
+	 * enable only for experiments.
+	 */
+#if defined(VENUS_WDT_DISABLE) && VENUS_WDT_DISABLE
 	wr32(WDT_BASE + 0x08, 0);
 	__asm__ volatile("dsb sy" ::: "memory");
-	HB(3);	/* watchdog disabled */
+#endif
+	HB(3);	/* shim_main past the (disabled) watchdog block */
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";

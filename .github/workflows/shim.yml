@@ -54,7 +54,7 @@ jobs:
       - name: Heartbeat variants (reboot to fastboot at checkpoint N)
         run: |
           mkdir -p hb
-          for n in 1 2 3 4 5 6; do
+          for n in 1 2 3 4 5 6 7; do
             EXTRA_CFLAGS="-DHEARTBEAT=$n" ./_ci_build_part.sh > /dev/null
             cp out/Image "hb/Image-hb$n"
           done
