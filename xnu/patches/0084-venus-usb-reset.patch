@@ -1,0 +1,129 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -169,9 +169,13 @@
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
++#define DEPCMD_CLEARSTALL       5
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
++#define DEPCMD_PARAM(x)         ((uint32_t)(x) << 16)
+ 
+ #define TRB_HWO         (1u << 0)
+ #define TRB_LST         (1u << 1)
+@@ -224,6 +228,9 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* by physical ep: transfer in flight, and its XferRscIdx */
++	bool        xfer_active[6];
++	uint8_t     xfer_rsc[6];
+ } ud;
+ 
+ static inline void
+@@ -293,7 +300,11 @@
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	int ret = ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ret == 0 && ep < 6) {
++		ud.xfer_active[ep] = true;
++		ud.xfer_rsc[ep] = (dwc_rd(DEPCMD(ep)) >> 16) & 0x7f;
++	}
+ }
+ 
+ static void
+@@ -692,14 +703,61 @@
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * Bus reset or disconnect (Linux dwc3 dwc3_stop_active_transfers): end the
++ * data transfers the host left active, drop the data endpoints, free the
++ * queued frames, and report the link down.
++ */
++static void
++ud_end_transfer(unsigned ep)
++{
++	if (ud.xfer_active[ep]) {
++		ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | DEPCMD_PARAM(ud.xfer_rsc[ep]), 0, 0, 0);
++		delay(100);
++		ud.xfer_active[ep] = false;
++	}
++}
++
++static void
++ud_stop_data(void)
++{
++	ud_end_transfer(EP_RX);
++	ud_end_transfer(EP_TX);
++	ud_end_transfer(EP_INT);
++	dwc_wr(DALEPENA, 0x3);
++	if (ud.lock != NULL) {
++		lck_mtx_lock(ud.lock);
++		for (unsigned i = 0; i < ud.txq_count; i++) {
++			mbuf_freem(ud.txq[(ud.txq_head + i) % UD_TXQ]);
++		}
++		ud.txq_head = ud.txq_count = 0;
++		ud.tx_busy = false;
++		lck_mtx_unlock(ud.lock);
++	}
++	if (ud.configured) {
++		ud.configured = false;
++		ud_link_event(false);
++	}
++	ud.data_alt = 0;
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
++			ud_stop_data();
++			int state_before = ud.state;
++			/* ep0 mid transfer: end it, stall and re-arm SETUP (Linux
++			 * dwc3_ep0_end_control_data + dwc3_ep0_stall_and_restart) */
++			if (ud.state != EP0_SETUP) {
++				ud_end_transfer(0);
++				ud_end_transfer(1);
++				ud_stall();
++			}
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++			printf("SWEET USB: bus reset (ep0 state %d)\n", state_before);
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -709,6 +767,7 @@
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
++			ud_stop_data();
+ 			printf("SWEET USB: disconnect\n");
+ 		}
+ 		return;
+@@ -717,6 +776,9 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (ep < 6 && type == 1) {      /* XferComplete: transfer no longer active */
++		ud.xfer_active[ep] = false;
++	}
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;
+@@ -774,7 +836,7 @@
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				if (ud.events++ < 200) {
++				if (ud.events++ < 2000 || (ev & 1)) {
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
+ 				ud_event(ev);
