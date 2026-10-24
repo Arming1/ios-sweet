@@ -8,7 +8,7 @@ shim 颜色测试和 MMFR0 读数；之后 XNU 把控制台日志画到帧缓冲
 ## 生成 payload（需要 macOS 构建出的内核）
     python3 tools/mkadt.py shim/out/venus.adt --highmem
     python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/venus.adt shim/out/payload.bin \
-        --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetkeys=0 sweetusb=0'
+        --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=0 rootrw=0 launchd_unsecure_cache=1 wdt=-1 sweettouch=0 sweetkeys=0 sweetusb=0 sweetlog=0'
     DTB=/path/to/venus.dtb shim/build.sh ../shim/out/payload.bin
     fastboot boot shim/out/shim-boot.img     # 只用 fb-guard 包装，绝不 flash
 

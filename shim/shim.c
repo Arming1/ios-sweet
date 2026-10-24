@@ -150,6 +150,8 @@ static void __attribute__((noreturn)) hb_report(unsigned n)
  * 100+k: timing calibration, reports the constant k.
  * 1 (D1): read MDSS HW_VERSION at 0xae00000 (SDE 7.0 on SM8350 -> 0x7xxxxxxx)
  *         and report its top nibble. A hang means the MDP is unclocked.
+ * 10 (U1): read-only USB probe (GCC power/clocks, DWC3, QSCRATCH), shown on screen.
+ *          No register writes, never resets; the last line on screen names a hung read.
  */
 #ifndef EXPERIMENT
 #define EXPERIMENT 0
@@ -231,10 +233,98 @@ static unsigned paint_active_pipes(void)
 	return painted;
 }
 
+/*
+ * U1 (-DEXPERIMENT=10): read-only USB probe. No writes at all. Each register
+ * pair is named on screen before it is read, so a hang leaves that line last.
+ */
+#define GCC_BASE		0x00100000UL
+#define DWC3_BASE		0x0a600000UL
+#define QSCRATCH_BASE		0x0a6f8800UL
+
+struct u1_reg {	/* no pointers: the shim runs unrelocated, tables must hold no addresses of data */
+	char name[8];
+	uint32_t addr;
+};
+
+static const struct u1_reg u1_gcc[] = {	/* GDSCR bit31 = power on; CBCRs bit31 = CLK_OFF */
+	{ "GDSCR", GCC_BASE + 0xf004 },	/* gcc-lahaina / venus DT qcom,gdsc@10f004 */
+	{ "MASTER", GCC_BASE + 0xf010 },
+	{ "SLEEP", GCC_BASE + 0xf018 },
+	{ "MOCK", GCC_BASE + 0xf01c },
+	{ "PHYAUX", GCC_BASE + 0xf054 },
+	{ "PHYCOM", GCC_BASE + 0xf058 },
+	{ "PHYPIPE", GCC_BASE + 0xf05c },
+	{ "CFGNOC", GCC_BASE + 0xf07c },
+	{ "AGGRE", GCC_BASE + 0xf080 },
+};
+
+static const struct u1_reg u1_dwc3[] = {
+	{ "SNPSID", DWC3_BASE + 0xc120 },
+	{ "GCTL", DWC3_BASE + 0xc110 },
+	{ "GSTS", DWC3_BASE + 0xc118 },
+	{ "USB2CFG", DWC3_BASE + 0xc200 },
+	{ "HWPAR0", DWC3_BASE + 0xc140 },
+	{ "DCFG", DWC3_BASE + 0xc700 },
+	{ "DCTL", DWC3_BASE + 0xc704 },
+	{ "DEVTEN", DWC3_BASE + 0xc708 },
+	{ "DSTS", DWC3_BASE + 0xc70c },
+	{ "DALEPEN", DWC3_BASE + 0xc720 },
+	{ "EVADLO", DWC3_BASE + 0xc400 },
+	{ "EVADHI", DWC3_BASE + 0xc404 },
+	{ "EVSIZ", DWC3_BASE + 0xc408 },
+	{ "EVCNT", DWC3_BASE + 0xc40c },
+};
+
+static const struct u1_reg u1_qscr[] = {
+	{ "GENCFG", QSCRATCH_BASE + 0x08 },
+	{ "HSPHY", QSCRATCH_BASE + 0x10 },
+	{ "SSPHY", QSCRATCH_BASE + 0x30 },
+};
+
+/* Read n registers two per line; tag is the group name shown before each pair. */
+static void u1_group(const char *tag, const struct u1_reg *r, uint32_t n, uint32_t *v)
+{
+	for (uint32_t i = 0; i < n; i += 2) {
+		uint32_t two = i + 1 < n;
+		con_hex2(tag, "next ", r[i].addr, two ? "next " : 0, two ? r[i + 1].addr : 0);
+		v[i] = rd32(r[i].addr);
+		if (two)
+			v[i + 1] = rd32(r[i + 1].addr);
+		__asm__ volatile("dsb sy" ::: "memory");
+		con_hex2(r[i].name, "", v[i], two ? r[i + 1].name : 0, two ? v[i + 1] : 0);
+	}
+}
+
+static void __attribute__((noreturn)) usb_u1_probe(void)
+{
+	uint32_t gv[sizeof(u1_gcc) / sizeof(u1_gcc[0])];
+	uint32_t dv[sizeof(u1_dwc3) / sizeof(u1_dwc3[0])];
+	uint32_t qv[sizeof(u1_qscr) / sizeof(u1_qscr[0])];
+
+	con_clear(DARKGREY);
+	con_str("USB", "u1 read-only probe, no writes");
+	u1_group("GCC", u1_gcc, sizeof(u1_gcc) / sizeof(u1_gcc[0]), gv);
+	/* DWC3 is only safe to touch with GCC power on and the master and cfg_noc clocks running */
+	if ((gv[0] >> 31) && !(gv[1] >> 31) && !(gv[7] >> 31)) {
+		con_str("USB", "next: DWC3");
+		u1_group("DWC3", u1_dwc3, sizeof(u1_dwc3) / sizeof(u1_dwc3[0]), dv);
+		/* QSCRATCH is the wrapper inside the same block: same power and clocks */
+		con_str("USB", "next: QSCRATCH");
+		u1_group("QSCR", u1_qscr, sizeof(u1_qscr) / sizeof(u1_qscr[0]), qv);
+	} else {
+		con_str("USB", "gated: DWC3/QSCRATCH not read");
+	}
+	con_str("USB", "done. hold Power 15s, then Power+VolDown");
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
 static void run_experiment(void)
 {
 	if (EXPERIMENT >= 100 && EXPERIMENT < 116)
 		hb_report(EXPERIMENT - 100);
+	if (EXPERIMENT == 10)
+		usb_u1_probe();
 	if (EXPERIMENT == 1) {
 		uint32_t v = rd32(MDSS_BASE);
 		__asm__ volatile("dsb sy" ::: "memory");

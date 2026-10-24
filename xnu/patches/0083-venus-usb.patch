@@ -1,0 +1,86 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1,14 +1,16 @@
+ /*
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+- * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+- * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+- * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
+- * controller for fastboot; this probe only reports what state it is left
+- * in after `fastboot boot`. It never writes a register, and it touches the
+- * DWC3 / PHY register blocks only when the GCC status registers say their
+- * power domain and clocks are on (an access to a gated block would hang).
++ * venus (Snapdragon 888): the USB controller is a Synopsys DWC_usb31 v1.10a
++ * (GSNPSID 0x33313130) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper.
++ * Its HS PHY is a SNPS femto PHY at 0x088e3000, which this driver never
++ * touches. Its power domain is the USB30_PRIM GDSC and its clocks come from
++ * GCC (offsets from Linux gcc-lahaina.c). ABL uses this controller for
++ * fastboot, at SuperSpeed; this driver only ever runs it at high speed
++ * (USB 2.0). This probe only reports what state it is left in after
++ * `fastboot boot`. It never writes a register, and it touches the DWC3
++ * register block only when the GCC status registers say its power domain
++ * and clocks are on (an access to a gated block would hang).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -52,18 +54,16 @@
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+ 	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "sleep", 0x0f018 },
++	{ "mock-utmi", 0x0f01c },
++	{ "cfg-noc-axi", 0x0f07c },
++	{ "aggre-axi", 0x0f080 },
++	{ "phy-aux", 0x0f054 },
++	{ "phy-pipe", 0x0f05c },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -119,19 +119,7 @@
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	/* venus: the femto HS PHY (0x088e3000) is set up by ABL and never read or written here. */
+ }
+ 
+ /*
+@@ -884,7 +872,11 @@
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
+-	/* High speed, address 0 */
++	/*
++	 * High speed (DEVSPD 0), address 0. DCFG DEVSPD 0 = high speed also on
++	 * DWC_usb31: ABL ran fastboot at SuperSpeed (DEVSPD 4); we stay on
++	 * USB 2.0, so the QMP SuperSpeed PHY is not needed.
++	 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+ 	/* Events: disconnect, USB reset, connect done */
