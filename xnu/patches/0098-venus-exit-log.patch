@@ -1,0 +1,77 @@
+SWEET/venus: diagnostic log of process exits. A daemon that exits without a
+signal leaves no CRASH line (fairplayd.H2 starts and exits at once). For each
+process named in boot-arg sweetscan, the Sandbox policy (0050) gets a
+proc_notify_exit hook that prints "EXIT name[pid] xstat 0x..." with the exit
+status and, when the exiting thread is the current one, sweet_crash_log's
+registers and user backtrace. Read-only; nothing is changed. Applies after
+0097 (sweet_amfi.c chain 0025, 0035, 0036, 0050, 0064, 0097).
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -27,6 +27,7 @@
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
++#include <pexpert/pexpert.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+@@ -414,9 +415,58 @@ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ 	return EPERM;
+ }
+ 
++/*
++ * Daemons that exit without a signal leave no CRASH line (fairplayd.H2 starts
++ * and exits at once without FairPlayIOKit). For the processes named in
++ * boot-arg sweetscan, log the exit status and, when the exiting thread is the
++ * current one, its registers and user backtrace (osfmk/kern/exception.c).
++ */
++extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++
++static char sweet_exit_names[128];
++static int sweet_exit_parsed;
++
++static int
++sweet_exit_wanted(const char *name)
++{
++	size_t n = strlen(name);
++	if (!sweet_exit_parsed) {
++		PE_parse_boot_argn("sweetscan", sweet_exit_names, sizeof(sweet_exit_names));
++		sweet_exit_parsed = 1;
++	}
++	for (const char *t = sweet_exit_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
++			return 1;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return 0;
++}
++
++static void
++sweet_sandbox_proc_exit(proc_t p)
++{
++	char name[32];
++	/* by pointer: during exit the pid lookup behind proc_name() may fail */
++	strlcpy(name, proc_best_name(p), sizeof(name));
++	if (!sweet_exit_wanted(name)) {
++		return;
++	}
++	printf("EXIT %s[%d] xstat 0x%x\n", name, proc_pid(p), proc_exitstatus(p));
++	if (p == current_proc()) {
++		sweet_crash_log(name, proc_pid(p), 0, 0, 0);
++	}
++}
++
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = sweet_sandbox_syscall,
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
++	.mpo_proc_notify_exit = sweet_sandbox_proc_exit,
+ };
+ 
+ static struct mac_policy_conf sweet_sandbox_mac_conf = {
