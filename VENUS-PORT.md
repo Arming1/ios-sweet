@@ -38,6 +38,18 @@ The shim can draw an image while it hands over to XNU.
 - The image and the generated header stay local: `shim/out` is git-ignored. No logo is shipped with the repo.
 - Tip: flat-colour logos compress far better than photos.
 
+## Silent boot video (optional)
+The shim can play a silent clip before it hands over to XNU.
+
+    SHIM_VIDEO_FILE=/path/clip.mp4 [SHIM_VIDEO_FPS=60] [SHIM_VIDEO_HOLD=1] shim/build.sh
+
+- Needs ffmpeg and Python 3 with Pillow. 360x640 by default, drawn 3x centred.
+- One global 256-colour palette, plus per-frame delta coding.
+- The shim image must stay below 16 MB (the ramdisk is at 0x1000000), so keep clips short.
+- Measured at 30 and 60 fps with 0 late frames (worst frame about 6.9 ms).
+- Playback stats are printed after the video. The default build then turns the MMU and caches off and boots XNU. `SHIM_VIDEO_HOLD=1` holds on the last frame instead (hold Power 15s to reset).
+- The clip stays local: `shim/out` is git-ignored.
+
 ## 与 sweet 不同的值
 | 项目 | sweet | venus |
 | --- | --- | --- |

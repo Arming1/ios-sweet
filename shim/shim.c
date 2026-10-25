@@ -1148,6 +1148,9 @@ static void __attribute__((noreturn)) video_v0_probe(void)
  * writes), then draw frame i when the generic timer reaches
  * t0 + i / VIDEO_FPS. A frame that starts more than one period late is
  * counted; later frames are not dropped, so the schedule catches up.
+ * Phase 2: the default build then turns the MMU and caches off again
+ * (mmu_disable) and returns, so the loader boots XNU with the MMU off as at
+ * entry. SHIM_VIDEO_HOLD=1 holds on the last frame instead.
  */
 #ifndef SHIM_VIDEO_HOLD
 #define SHIM_VIDEO_HOLD 0
@@ -1192,18 +1195,15 @@ static void video_play(void)
 
 	con_hex2("VIDEO", "frames=", VIDEO_FRAMES, "ms=", to_us(t_end - t0) / 1000);
 	con_hex2("", "late=", late, "worst_us=", worst_us);
-	/*
-	 * Both builds hold on the last frame for now. SHIM_VIDEO_HOLD only
-	 * picks the message; booting the loader after the video (MMU off) is
-	 * phase 2 and is not implemented.
-	 */
 #if SHIM_VIDEO_HOLD
 	con_str("VIDEO", "done: holding last frame (hold Power 15s to reset)");
-#else
-	con_str("VIDEO", "done: holding (boot after video: todo)");
-#endif
 	for (;;)
 		__asm__ volatile("wfe");
+#else
+	con_str("VIDEO", "done: MMU off, booting XNU");
+	delay_ms(500);	/* keep the last frame on screen a moment */
+	mmu_disable(&mi);	/* MMU and caches back to the ABL state; returns */
+#endif
 }
 #endif
 
@@ -1241,7 +1241,7 @@ void shim_main(uint64_t dtb)
 	con_logo(logo_pal, logo_rle, LOGO_RLE_LEN, LOGO_W, LOGO_H, 3, 1000);
 #endif
 #ifdef SHIM_VIDEO
-	video_play();	/* holds on the video; returns only if mmu_enable failed */
+	video_play();	/* plays the video; returns (MMU off again) unless SHIM_VIDEO_HOLD */
 #endif
 	HB(4);	/* framebuffer written */
 	con_str("SHIM", "sweet milestone 4: xnu loader");

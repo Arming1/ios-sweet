@@ -130,3 +130,19 @@ uint64_t mmu_probe(uintptr_t va)
 	__asm__ volatile("at s1e1r, %0; isb" : : "r"(va) : "memory");
 	return rsr("par_el1");
 }
+
+/* cache.S: clean + invalidate, SCTLR_EL1 = sctlr_restore, clean + invalidate again. */
+void mmu_off_asm(uint64_t sctlr_restore);
+
+/*
+ * Back to the MMU/cache state ABL left (normally all off), for the loader.
+ * The clean inside mmu_off_asm must be the last write to memory before
+ * SCTLR_EL1 changes: a store after it would be a dirty WB line that the
+ * disabled caches never write back, and the loader would read stale data.
+ * So nothing here touches memory: info is read before the call, and the
+ * call is a tail call (no stack frame, no stores).
+ */
+void mmu_disable(const struct mmu_info *info)
+{
+	mmu_off_asm(info->sctlr_before);
+}
