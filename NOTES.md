@@ -1,5 +1,48 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## venus (Xiaomi Mi 11, SM8350) handoff — 2026-10-25 (read this first for venus work)
+
+The rest of this file below is the upstream sweet history; venus details are in VENUS-PORT.md (boot-args, patches 0082-0098, root causes) and README.md.
+
+- Branch / remotes: fork `Arming1/ios-sweet`, branch `venus-ios16-build` (remote `fork`). Latest commits: 8686d97 VENUS-PORT, 6258644 README, ce6b479 win-usbstream --rotate, 223ce8f shim USB live video, 30c643a shim boot-after-video, 1226cad shim silent video, 0be218a patch 0098.
+- Kernel CI: `gh workflow run xnu.yml -R Arming1/ios-sweet --ref venus-ios16-build` (~8 min), download with `gh run download <id> -n xnu-kernel`. Last kernel run 40189119596 (patches to 0098).
+- State on the phone (verified 2026-10-25):
+  - iOS 16.7.16 (iPhone X userland) boots to lock screen in ~1.5 min.
+  - Settings incl. About and iPhone Storage work; touch; power/vol+/vol- keys; native 1440x3200.
+  - 8 cores AMP (E: 0-3 A55, P: 4-7 A78/X1).
+  - cpufreq via `sweetcpufreq=15,10,10` (A55 1802, A78 1880, X1 2262 MHz measured).
+  - Live kernel log over USB RNDIS (`sweetusb=3`, UDP 5140 to 192.168.7.1).
+- Not working: GPU (CPU rendering, slow), Wi-Fi, BT, audio, camera, cellular, RTC (1969), battery (static), backlight, FairPlay (fairplayd.H2 exits 0 without Apple's FairPlayIOKit).
+- iOS root on userdata was modified on the phone (user-approved, via `sweetunlink`):
+  - removed `/System/Library/PreferenceBundles/StoragePlugins/PodcastsUsagePlugin.bundle/PodcastsUsagePlugin` and `/System/Library/SyncBundles/AirFair.syncBundle/AirFair`;
+  - MobileGestalt cache deleted once after the display-size change.
+  - Reflashing userdata restores them -> redo these.
+- Recommended command line (= VENUS-PORT.md variant 1, full iOS boot):
+  - `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweettouch=1 sweetkeys=1 sweetusb=3 sweetnoexec=bluetoothd sweetfb_native=1 ufswait=1 ufscache=1 sweetcpufreq=15,10,10`
+  - ADT: `tools/mkadt.py --highmem --canvas 1440x3200 --subtype 2778`.
+  - Kernel-only tests: same + `ufsrw=0 rootrw=0 sweetlog=0 ufsroot=persist`, and KEEP `rd=ufsroot0` (without it no sweet driver starts).
+- Boot image recipe: Android boot image header v3; kernel = shim Image (stock shim = bytes 0x1000..+0x2c000 of an older working image, or `shim/build.sh` output); ramdisk = `tools/mkpayload.py` payload.
+  - Boot ONLY with `fastboot boot`. Outer project wraps it with `tools/fb-guard.sh`; images with ufsrw=1/rootrw=1 need `ALLOW_USERDATA_WRITES=ios-root-installed` for `tools/payload-writeguard.py`.
+  - Check `fastboot getvar slot-unbootable:b` before boots.
+- Safety (must keep):
+  - never flash boot/vbmeta/dtbo; only userdata (the iOS root) is ever flashed;
+  - never relock the bootloader;
+  - never let the phone normal-boot into Android (userdata is HFS+) — reboot into fastboot (Power+VolDown) or recovery;
+  - holding Power ~10 s is a PMIC hard reset.
+- Local artifacts (developer PC, not in git) under `D:\MI 11 IOS16 Challenge\`:
+  - `build\venus\ios20\venus-ios-v20.img` (best full iOS image; kernel scratch\xnu-out17);
+  - `build\venus\video\` (venus-u3b.img = shim experiment 17 USB stream receiver; venus-stream-ios.img = stream then boot iOS; venus-vid*.img = embedded video tests);
+  - `scratch\logo` and `scratch\video` (user's private logo/clips — never commit);
+  - `device-info\usblog\` (live logs); `tools\win-usblog.py` (Windows RNDIS UDP receiver); `notes\gpu-port-assessment.md`.
+- Shim extras (optional, local media only): SHIM_LOGO_IMAGE, SHIM_VIDEO_FILE (+SHIM_VIDEO_FPS, SHIM_VIDEO_HOLD), SHIM_USBSTREAM=1 with `tools/win-usbstream.py` (--play/--testpattern/--bench; WinUSB 1209:0003; 35 MB/s bulk; 360x640 RGB565 60 fps). See VENUS-PORT.md.
+- Debug tools that worked: shim experiments 10-17 (screen output, photograph); sweetsample / sweetscan / sweetbusy / 0098 EXIT logs over the USB log; symbolication with blacktop `ipsw dyld a2s` against the IPSW's dyld shared cache (unslide = addr - slide from the CRASH/SMP line).
+- Next steps (candidates):
+  - GPU (Adreno 660; HackiOS redwood driver is the closest reference, see notes/gpu-port-assessment.md in the outer project);
+  - daily command line without diagnostics;
+  - earlier cpufreq switch (now 15 s after boot);
+  - backlight/display power;
+  - USB SuperSpeed in the shim for higher stream bandwidth (fastboot already runs SS).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
