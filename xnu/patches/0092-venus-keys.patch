@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,7 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * See hw-report.md: volume-up is PM8350 (SID 1) GPIO6; power and volume-down are
++ * PMK8350 (SID 0) PON KPDPWR/RESIN.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -20,8 +21,13 @@
+ #define KEYS_CORE_PA     0x0c440000u
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+-#define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_PON_RT      0x1310u
++#define KEYS_GPIO_RT     0x8d10u
++#define KEYS_GPIO_MODE   0x8d40u
++#define KEYS_GPIO_EN     0x8d46u
++#define KEYS_GPIO_SUBTYPE 0x8d05u
++#define KEYS_PON_PPID    0x013u
++#define KEYS_GPIO_PPID   0x18du
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+@@ -113,7 +119,7 @@
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio6:8d10=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -151,22 +157,22 @@
+ 		    keys_version, count);
+ 		return;
+ 	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_pon_apid = keys_find_apid(KEYS_PON_PPID, count);
++	keys_gpio_apid = keys_find_apid(KEYS_GPIO_PPID, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_MODE, &mode);
++	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_EN, &en);
++	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_SUBTYPE, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio6-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO6 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
