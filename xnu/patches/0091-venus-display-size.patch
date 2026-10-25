@@ -1,0 +1,164 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -459,6 +459,26 @@
+ 	return is_ramdisk;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/uio.h>
++
++/*
++ * sweetunlink=PATH: delete one file of the root filesystem before launchd
++ * starts, e.g. MobileGestalt's cache after a display size change (it keeps
++ * the old screen answers otherwise). Absolute paths only.
++ */
++static void
++sweet_boot_unlink(void)
++{
++	char path[256];
++	if (!PE_parse_boot_argn("sweetunlink", path, sizeof(path)) || path[0] != '/') {
++		return;
++	}
++	int error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(path), UIO_SYSSPACE, 0);
++	printf("SWEET: sweetunlink %s -> %d\n", path, error);
++}
++#endif
++
+ /*
+  * This function is called very early on in the Mach startup, from the
+  * function start_kernel_threads() in osfmk/kern/startup.c.  It's called
+@@ -1098,6 +1118,10 @@
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_unlink();
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,7 +76,8 @@
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * Boot-arg sweetfb_native=1 presents the real panel size instead, and
++ * sweetfb_size=WxH (e.g. 1284x2778, even, not larger than the panel) another one.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -149,6 +150,33 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/* "WxH" with decimal digits only, e.g. "1284x2778"; false for anything else. */
++static bool
++sweet_parse_size(const char *s, int *w, int *h)
++{
++	int v[2] = { 0, 0 };
++	int i = 0;
++
++	for (int part = 0; part < 2; part++) {
++		int digits = 0;
++		while (s[i] >= '0' && s[i] <= '9') {
++			if (++digits > 5) {
++				return false;
++			}
++			v[part] = v[part] * 10 + (s[i++] - '0');
++		}
++		if (digits == 0 || (part == 0 && s[i++] != 'x')) {
++			return false;
++		}
++	}
++	if (s[i] != '\0') {
++		return false;
++	}
++	*w = v[0];
++	*h = v[1];
++	return true;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -173,6 +201,17 @@
+ 	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
++		char size[16];
++		int w = 0, h = 0;
++		if (PE_parse_boot_argn("sweetfb_size", size, sizeof(size))) {
++			if (sweet_parse_size(size, &w, &h) && w > 0 && h > 0 &&
++			    (uint32_t)w <= fWidth && (uint32_t)h <= fHeight && w % 2 == 0 && h % 2 == 0) {
++				fLogicalW = (uint32_t)w;
++				fLogicalH = (uint32_t)h;
++			} else {
++				IOLog("SWEET FB: sweetfb_size=%s ignored\n", size);
++			}
++		}
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -428,6 +428,33 @@
+ 	}
+ }
+ 
++/* "WxH" with decimal digits only, e.g. "1284x2778"; false for anything else. */
++static bool
++sweet_parse_size(const char *s, int *w, int *h)
++{
++	int v[2] = { 0, 0 };
++	int i = 0;
++
++	for (int part = 0; part < 2; part++) {
++		int digits = 0;
++		while (s[i] >= '0' && s[i] <= '9') {
++			if (++digits > 5) {
++				return false;
++			}
++			v[part] = v[part] * 10 + (s[i++] - '0');
++		}
++		if (digits == 0 || (part == 0 && s[i++] != 'x')) {
++			return false;
++		}
++	}
++	if (s[i] != '\0') {
++		return false;
++	}
++	*w = v[0];
++	*h = v[1];
++	return true;
++}
++
+ bool
+ SweetHIDTouch::start(IOService *provider)
+ {
+@@ -439,6 +466,14 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1440 : 1125;
+ 	fLogicalH = native ? 3200 : 2436;
++	char size[16];
++	int w = 0, h = 0;
++	if (!native && PE_parse_boot_argn("sweetfb_size", size, sizeof(size)) &&
++	    sweet_parse_size(size, &w, &h) && w > 0 && h > 0 && w <= 1440 && h <= 3200 &&
++	    w % 2 == 0 && h % 2 == 0) {
++		fLogicalW = w;
++		fLogicalH = h;
++	}
+ 	fOffX = (fLogicalW - 1440) / 2;
+ 	fOffY = (fLogicalH - 3200) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+@@ -466,7 +501,7 @@
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
++	/* Panel pixels -> the presented display (SweetFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
