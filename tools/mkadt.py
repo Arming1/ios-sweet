@@ -3,8 +3,11 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--smp]
+                     [--canvas WxH] [--subtype N]
+  --canvas WxH  disp0 canvas size iOS renders (default 1125x2436)
+  --subtype N   /product artwork-device-subtype (default from the D22AP tree)
 """
-import hashlib, os, struct, sys
+import hashlib, os, re, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
@@ -68,9 +71,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, smp=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, smp=False, canvas=None, subtype=None):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    canvas=(W, H) overrides disp0 canvas-width/height; subtype=N overrides /product artwork-device-subtype."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    canvas_w, canvas_h = canvas if canvas else (1125, 2436)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -177,14 +182,15 @@ def build(seed=None, qemu=False, highmem=False, smp=False):
         node('wdt', [ph(), ('no-pmu', u32(1))]),
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
-        # (the presented iPhone X size, see SweetFramebuffer.cpp);
+        # (the presented iPhone X size, see SweetFramebuffer.cpp; --canvas WxH
+        # overrides the default 1125x2436);
         # the kernel's AppleCLCD matches the compatible string.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(canvas_w)),
+            ('canvas-height', u32(canvas_h)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -218,6 +224,10 @@ def build(seed=None, qemu=False, highmem=False, smp=False):
     ])
 
     product_props = d22ap_product()
+    if subtype is not None:
+        if not product_props or not any(k == 'artwork-device-subtype' for k, v in product_props):
+            raise SystemExit('mkadt.py: --subtype: /product has no artwork-device-subtype property')
+        product_props = [(k, u32(subtype) if k == 'artwork-device-subtype' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
@@ -235,8 +245,35 @@ def build(seed=None, qemu=False, highmem=False, smp=False):
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
 
 
+def flag_value(flag):
+    """Value of `flag VALUE` on the command line, or None if the flag is absent."""
+    if flag not in sys.argv:
+        return None
+    i = sys.argv.index(flag)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith('--'):
+        raise SystemExit(f'mkadt.py: {flag} needs a value')
+    return sys.argv[i + 1]
+
+
+def parse_canvas(s):
+    m = re.fullmatch(r'([1-9][0-9]*)x([1-9][0-9]*)', s)
+    if not m:
+        raise SystemExit(f'mkadt.py: --canvas {s!r}: expected WxH with positive integers, e.g. 1284x2778')
+    return int(m.group(1)), int(m.group(2))
+
+
+def parse_subtype(s):
+    if not re.fullmatch(r'[0-9]+', s) or int(s) > 0xffffffff:
+        raise SystemExit(f'mkadt.py: --subtype {s!r}: expected an unsigned 32-bit integer')
+    return int(s)
+
+
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, smp='--smp' in sys.argv)
+    canvas_arg, subtype_arg = flag_value('--canvas'), flag_value('--subtype')
+    canvas = parse_canvas(canvas_arg) if canvas_arg is not None else None
+    subtype = parse_subtype(subtype_arg) if subtype_arg is not None else None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, smp='--smp' in sys.argv,
+                 canvas=canvas, subtype=subtype)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
