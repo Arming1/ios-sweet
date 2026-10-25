@@ -1,11 +1,14 @@
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -459,6 +459,26 @@
+@@ -459,6 +459,29 @@
  	return is_ramdisk;
  }
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/uio.h>
++
++/* bsd/vfs/vfs_syscalls.c (not in a header) */
++int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
 +
 +/*
 + * sweetunlink=PATH: delete one file of the root filesystem before launchd
@@ -27,7 +30,7 @@
  /*
   * This function is called very early on in the Mach startup, from the
   * function start_kernel_threads() in osfmk/kern/startup.c.  It's called
-@@ -1098,6 +1118,10 @@
+@@ -1098,6 +1121,10 @@
  
  	bsd_init_kprintf("bsd_do_post - done");
  
