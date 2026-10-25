@@ -1,0 +1,32 @@
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -18,12 +18,14 @@
+ #define SWEET                     1
+ 
+ /*
+- * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
+- * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+- * clusters yet).
++ * venus: eight cores in two clusters. The four A55s are the E cluster
++ * (boot cluster, CPU 0); the three A78s plus the X1 are the P cluster. The
++ * split is set by the ADT "cluster-type" property ('E'/'P', see
++ * tools/mkadt.py). With __ARM_AMP__ the Edge scheduler keeps threads on P
++ * and spills to E (no CLPC).
+  */
+ #define SWEET_SMP_MAX_CPUS         8
++#define __ARM_AMP__               1
+ 
+ #define ARM_ARCH_TIMER
+ #define __ARM_ARCH__              8
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -102,7 +102,7 @@
+ 
+ #define MAX_L2_CLINE                   6
+ #define MAX_CPUS                       8
+-#define MAX_CPU_CLUSTERS               1
++#define MAX_CPU_CLUSTERS               2 /* venus: E (A55) and P (A78+X1) clusters, see SWEET.h */
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 

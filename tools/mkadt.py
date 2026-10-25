@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--smp]
 """
 import hashlib, os, struct, sys
 
@@ -68,7 +68,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, smp=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -120,21 +120,29 @@ def build(seed=None, qemu=False, highmem=False):
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
     # SWEET SMP: all eight cores in physical-core order (0-3 Cortex-A55,
-    # 4-6 Cortex-A78, 7 Cortex-X1 on the venus SM8350), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # 4-6 Cortex-A78, 7 Cortex-X1 on the venus SM8350). By default this is two
+    # clusters for AMP: cores 0-3 are E (cluster-id 0, boot cluster) and cores
+    # 4-7 are P (cluster-id 1); XNU reads cluster-type as an integer ('E'/'P').
+    # --smp keeps the old single homogeneous SMP cluster (cluster-type 0).
+    # QEMU always keeps its original single-CPU tree: its MPIDRs differ from sweet.
+    # The kernel defaults to one and uses cpus=N to select an initial prefix (N <= 8).
+    amp = not (qemu or smp)
     cpu_nodes = []
     for core in range(1 if qemu else 8):
+        if amp:
+            cluster_id, cluster_type, cluster_core = (0, ord('E'), core) if core < 4 else (1, ord('P'), core - 4)
+        else:
+            cluster_id, cluster_type, cluster_core = 0, 0, core  # homogeneous CLUSTER_TYPE_SMP
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-id', u32(cluster_id)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-type', u32(cluster_type)),
             ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(core)),
+            ('cluster-core-id', u32(cluster_core)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
@@ -228,7 +236,7 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, smp='--smp' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

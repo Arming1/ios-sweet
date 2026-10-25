@@ -1,0 +1,71 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7325,6 +7325,54 @@
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sweetnoexec=NAME[,NAME...]: refuse to exec the named programs (matched
++ * against p_name), so launchd stops relaunching daemons that crash for lack
++ * of hardware.
++ */
++static char sweet_noexec[256];
++static bool sweet_noexec_parsed = false;
++static uint32_t sweet_noexec_logged = 0;
++
++static bool
++sweet_exec_denied(const char *name)
++{
++	if (!sweet_noexec_parsed) {
++		PE_parse_boot_argn("sweetnoexec", sweet_noexec, sizeof(sweet_noexec));
++		sweet_noexec_parsed = true;     /* written after the buffer */
++	}
++	if (sweet_noexec[0] == '\0') {
++		return false;
++	}
++
++	size_t namelen = strlen(name);
++	const char *p = sweet_noexec;
++	while (*p != '\0') {
++		const char *end = p;
++		while (*end != '\0' && *end != ',') {
++			end++;
++		}
++		size_t elen = (size_t)(end - p);
++		/* p_name is MAXCOMLEN-truncated, so a full-length name may match a longer entry. */
++		bool match = (elen == namelen && strncmp(p, name, namelen) == 0) ||
++		    (namelen == MAXCOMLEN && elen > namelen && strncmp(p, name, namelen) == 0);
++		if (match) {
++			if (sweet_noexec_logged < 3) {
++				sweet_noexec_logged++;
++				printf("SWEET EXEC: denied %s (sweetnoexec)\n", name);
++			}
++			return true;
++		}
++		if (*end == '\0') {
++			break;
++		}
++		p = end + 1;
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+ {
+@@ -7386,6 +7434,13 @@
+ 		goto done;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_exec_denied(p->p_name)) {
++		error = EPERM;
++		goto done;
++	}
++#endif
++
+ #if XNU_TARGET_OS_OSX
+ 	/* Check for platform passed in spawn attr if iOS binary is being spawned */
+ 	if (proc_platform(p) == PLATFORM_IOS) {
