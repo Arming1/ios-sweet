@@ -1,0 +1,594 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -41,7 +41,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+-static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void sweet_usb_gadget_start(vm_offset_t dwc, bool rndis);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -80,7 +80,7 @@
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 (default) report state only, 2 start the USB device (CDC-ECM), 3 the same as RNDIS */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		return;
+@@ -117,7 +117,7 @@
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
++		sweet_usb_gadget_start(dwc, enabled == 3);
+ 	}
+ 	/* venus: the femto HS PHY (0x088e3000) is set up by ABL and never read or written here. */
+ }
+@@ -231,6 +231,14 @@
+ 	/* by physical ep: transfer in flight, and its XferRscIdx */
+ 	bool        xfer_active[6];
+ 	uint8_t     xfer_rsc[6];
++	/* RNDIS (sweetusb=3) */
++	bool        rndis;          /* RNDIS function instead of CDC-ECM */
++	bool        rndis_cmd;      /* SEND_ENCAPSULATED_COMMAND data stage in flight */
++	bool        rndis_up;       /* packet filter set: link reported up */
++	uint32_t    rndis_len;      /* wLength of that command */
++	uint32_t    rndis_filter;   /* OID_GEN_CURRENT_PACKET_FILTER */
++	uint32_t    rsp_len;        /* response waiting in ud_rsp, 0 if none */
++	uint32_t    rx_bad;         /* malformed RNDIS packets dropped */
+ } ud;
+ 
+ static inline void
+@@ -327,10 +335,70 @@
+ 	ud_start_setup();
+ }
+ 
++/* RNDIS (sweetusb=3) message types, OIDs and statuses (rndis.h, ndis.h). */
++#define RNDIS_PACKET                0x00000001
++#define RNDIS_INIT                  0x00000002
++#define RNDIS_HALT                  0x00000003
++#define RNDIS_QUERY                 0x00000004
++#define RNDIS_SET                   0x00000005
++#define RNDIS_RESET                 0x00000006
++#define RNDIS_KEEPALIVE             0x00000008
++#define RNDIS_COMPLETION            0x80000000u
++#define RNDIS_STATUS_SUCCESS        0
++#define RNDIS_STATUS_INVALID_LENGTH 0xc0010014u
++#define RNDIS_STATUS_INVALID_DATA   0xc0010015u
++#define RNDIS_STATUS_NOT_SUPPORTED  0xc00000bbu
++#define RNDIS_PKT_HDR               44          /* RNDIS_PACKET_MSG header; data at byte 44 */
++#define UD_RNDIS_MAX                512         /* largest encapsulated command or response */
++#define RNDIS_OID_GEN_SUPPORTED_LIST        0x00010101
++#define RNDIS_OID_GEN_HARDWARE_STATUS       0x00010102
++#define RNDIS_OID_GEN_MEDIA_SUPPORTED       0x00010103
++#define RNDIS_OID_GEN_MEDIA_IN_USE          0x00010104
++#define RNDIS_OID_GEN_MAXIMUM_FRAME_SIZE    0x00010106
++#define RNDIS_OID_GEN_LINK_SPEED            0x00010107
++#define RNDIS_OID_GEN_TRANSMIT_BLOCK_SIZE   0x0001010a
++#define RNDIS_OID_GEN_RECEIVE_BLOCK_SIZE    0x0001010b
++#define RNDIS_OID_GEN_VENDOR_ID             0x0001010c
++#define RNDIS_OID_GEN_VENDOR_DESCRIPTION    0x0001010d
++#define RNDIS_OID_GEN_CURRENT_PACKET_FILTER 0x0001010e
++#define RNDIS_OID_GEN_MAXIMUM_TOTAL_SIZE    0x00010111
++#define RNDIS_OID_GEN_MEDIA_CONNECT_STATUS  0x00010114
++#define RNDIS_OID_GEN_VENDOR_DRIVER_VERSION 0x00010116
++#define RNDIS_OID_GEN_PHYSICAL_MEDIUM       0x00010202
++#define RNDIS_OID_GEN_XMIT_OK               0x00020101
++#define RNDIS_OID_GEN_RCV_OK                0x00020102
++#define RNDIS_OID_GEN_XMIT_ERROR            0x00020103
++#define RNDIS_OID_GEN_RCV_ERROR             0x00020104
++#define RNDIS_OID_GEN_RCV_NO_BUFFER         0x00020105
++#define RNDIS_OID_802_3_PERMANENT_ADDRESS   0x01010101
++#define RNDIS_OID_802_3_CURRENT_ADDRESS     0x01010102
++#define RNDIS_OID_802_3_MULTICAST_LIST      0x01010103
++#define RNDIS_OID_802_3_MAXIMUM_LIST_SIZE   0x01010104
++#define RNDIS_OID_802_3_MAC_OPTIONS         0x01010105
++
++static uint8_t ud_rsp[UD_RNDIS_MAX];    /* pending RNDIS response (GET_ENCAPSULATED_RESPONSE) */
++
++static void
++ud_put_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++static uint32_t
++ud_get_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
+ /*
+  * USB descriptors: a CDC-ECM (Ethernet) function, which Linux (cdc_ether)
+  * and macOS drive without extra drivers. VID 0x1209 / PID 0x0001 =
+- * pid.codes test ID, not a product.
++ * pid.codes test ID, not a product. sweetusb=3 presents RNDIS instead
++ * (PID 0x0002) for Windows hosts: its inbox driver matches the compatible
++ * ID USB\Class_EF&SubClass_04&Prot_01.
+  */
+ static const uint8_t ud_dev_desc[18] = {
+ 	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
+@@ -348,11 +416,30 @@
+ 	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
+ 	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
+ };
++/* RNDIS (sweetusb=3): IAD, control interface 0, data interface 1 (alt 0 only, two endpoints) */
++static const uint8_t ud_rndis_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0xef, 0x02, 0x01, 64,
++	0x09, 0x12, 0x02, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++static const uint8_t ud_rndis_cfg_desc[75] = {
++	9, 2, 75, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	8, 0x0b, 0, 2, 0xef, 0x04, 0x01, 0,             /* IAD: interfaces 0-1, RNDIS */
++	9, 4, 0, 0, 1, 0xef, 0x04, 0x01, 0,             /* control interface 0: 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x01, 0x00, 1,                         /* call management: data interface 1 */
++	4, 0x24, 0x02, 0x00,                            /* ACM: no capabilities */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
++	9, 4, 1, 0, 2, 0x0a, 0x00, 0x00, 0,            /* data interface 1 alt 0: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
+ /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
+ static const char *const ud_strings[] = {
+ 	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++static const uint8_t ud_host_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
+ 
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+@@ -364,7 +451,7 @@
+ 	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) {
+ 		return 0;
+ 	}
+-	const char *str = ud_strings[idx];
++	const char *str = (idx == 2 && ud.rndis) ? "Sweet iOS (USB RNDIS)" : ud_strings[idx];
+ 	uint32_t n = 2;
+ 	for (; *str && n < 126; str++) {
+ 		out[n++] = (uint8_t)*str;
+@@ -412,7 +499,7 @@
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
+ 	ud_rx_arm();
+-	printf("SWEET USB: ECM endpoints configured\n");
++	printf("SWEET USB: %s endpoints configured\n", ud.rndis ? "RNDIS" : "ECM");
+ }
+ 
+ static void
+@@ -431,12 +518,29 @@
+ 	ud.data_in = (type & 0x80) != 0;
+ 	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
+ 		ok = (length == 0);
++		if (ud.rndis && index == 0 && type == 0x21 && req == 0x00) {
++			/* SEND_ENCAPSULATED_COMMAND: the RNDIS message is the OUT data stage */
++			ok = length != 0 && length <= UD_RNDIS_MAX;
++			ud.rndis_cmd = ok;
++			ud.rndis_len = length;
++		} else if (ud.rndis && index == 0 && type == 0xa1 && req == 0x01) {
++			/* GET_ENCAPSULATED_RESPONSE: the pending response, or one zero byte */
++			if (ud.rsp_len) {
++				memcpy(data, ud_rsp, ud.rsp_len);
++				n = ud.rsp_len;
++			} else {
++				data[0] = 0;
++				n = 1;
++			}
++			ud.rsp_len = 0;
++			ok = true;
++		}
+ 	} else if ((type & 0x60) != 0) {
+ 		ok = false;
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+-		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 1: n = sizeof(ud_dev_desc); memcpy(data, ud.rndis ? ud_rndis_dev_desc : ud_dev_desc, n); break;
++		case 2: n = ud.rndis ? sizeof(ud_rndis_cfg_desc) : sizeof(ud_cfg_desc); memcpy(data, ud.rndis ? ud_rndis_cfg_desc : ud_cfg_desc, n); break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -456,7 +560,7 @@
+ 	} else if (req == 11) {         /* SET_INTERFACE */
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+-			if (value == 1 && ud.configured) {
++			if (value == 1 && ud.configured && !ud.rndis) {
+ 				ud_notify_connected();
+ 				ud_link_event(true);
+ 			}
+@@ -482,10 +586,273 @@
+ 		}
+ 		ud_start(1, UD_DATA, n, TRBCTL_DATA);
+ 	} else {
+-		ud_start(0, UD_DATA, 64, TRBCTL_DATA);  /* OUT data is not used here */
++		ud_start(0, UD_DATA, ud.rndis_cmd ? ((ud.rndis_len + 63) & ~63u) : 64, TRBCTL_DATA);  /* OUT data: RNDIS command, else unused */
++	}
++}
++
++/* ---- RNDIS (sweetusb=3): control messages in ep0, one response at a time ---- */
++
++static uint32_t ud_rndis_logged;        /* bit per message type: first one logged */
++static unsigned ud_rndis_prints;        /* limit for unknown and malformed input */
++
++static void
++ud_rndis_warn(const char *what, uint32_t v)
++{
++	if (ud_rndis_prints++ < 16) {
++		printf("SWEET USB: rndis %s 0x%08x\n", what, v);
++	}
++}
++
++static const char *
++ud_rndis_name(uint32_t type)
++{
++	switch (type) {
++	case RNDIS_INIT: return "INITIALIZE";
++	case RNDIS_HALT: return "HALT";
++	case RNDIS_QUERY: return "QUERY";
++	case RNDIS_SET: return "SET";
++	case RNDIS_RESET: return "RESET";
++	case RNDIS_KEEPALIVE: return "KEEPALIVE";
++	default: return NULL;
++	}
++}
++
++/* Response header; the caller writes the rest of the message. */
++static void
++ud_rsp_hdr(uint32_t type, uint32_t len, uint32_t id)
++{
++	ud_put_le32(ud_rsp, type);
++	ud_put_le32(ud_rsp + 4, len);
++	ud_put_le32(ud_rsp + 8, id);
++	ud.rsp_len = len;
++}
++
++/* Value of a QUERY OID: n bytes at out. Unknown OIDs are NOT_SUPPORTED. */
++static uint32_t
++ud_oid_get(uint32_t oid, uint8_t *out, uint32_t *n)
++{
++	static const uint32_t supported[] = {
++		RNDIS_OID_GEN_SUPPORTED_LIST, RNDIS_OID_GEN_HARDWARE_STATUS, RNDIS_OID_GEN_MEDIA_SUPPORTED,
++		RNDIS_OID_GEN_MEDIA_IN_USE, RNDIS_OID_GEN_MAXIMUM_FRAME_SIZE, RNDIS_OID_GEN_LINK_SPEED,
++		RNDIS_OID_GEN_TRANSMIT_BLOCK_SIZE, RNDIS_OID_GEN_RECEIVE_BLOCK_SIZE, RNDIS_OID_GEN_VENDOR_ID,
++		RNDIS_OID_GEN_VENDOR_DESCRIPTION, RNDIS_OID_GEN_CURRENT_PACKET_FILTER,
++		RNDIS_OID_GEN_MAXIMUM_TOTAL_SIZE, RNDIS_OID_GEN_MEDIA_CONNECT_STATUS, RNDIS_OID_GEN_PHYSICAL_MEDIUM,
++		RNDIS_OID_GEN_VENDOR_DRIVER_VERSION, RNDIS_OID_GEN_XMIT_OK, RNDIS_OID_GEN_RCV_OK,
++		RNDIS_OID_GEN_XMIT_ERROR, RNDIS_OID_GEN_RCV_ERROR, RNDIS_OID_GEN_RCV_NO_BUFFER,
++		RNDIS_OID_802_3_PERMANENT_ADDRESS, RNDIS_OID_802_3_CURRENT_ADDRESS,
++		RNDIS_OID_802_3_MULTICAST_LIST, RNDIS_OID_802_3_MAXIMUM_LIST_SIZE, RNDIS_OID_802_3_MAC_OPTIONS,
++	};
++	uint32_t v = 0;
++
++	*n = 4;
++	switch (oid) {
++	case RNDIS_OID_GEN_SUPPORTED_LIST:
++		for (unsigned i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
++			ud_put_le32(out + 4 * i, supported[i]);
++		}
++		*n = (uint32_t)sizeof(supported);
++		return RNDIS_STATUS_SUCCESS;
++	case RNDIS_OID_GEN_HARDWARE_STATUS:
++	case RNDIS_OID_GEN_MEDIA_SUPPORTED:
++	case RNDIS_OID_GEN_MEDIA_IN_USE:
++	case RNDIS_OID_GEN_MEDIA_CONNECT_STATUS:
++	case RNDIS_OID_GEN_PHYSICAL_MEDIUM:
++	case RNDIS_OID_GEN_XMIT_ERROR:
++	case RNDIS_OID_GEN_RCV_ERROR:
++	case RNDIS_OID_GEN_RCV_NO_BUFFER:
++	case RNDIS_OID_802_3_MAC_OPTIONS:
++		break;
++	case RNDIS_OID_GEN_MAXIMUM_FRAME_SIZE: v = 1500; break;
++	case RNDIS_OID_GEN_LINK_SPEED: v = 4800000; break;      /* units of 100 bps: 480 Mb/s */
++	case RNDIS_OID_GEN_TRANSMIT_BLOCK_SIZE:
++	case RNDIS_OID_GEN_RECEIVE_BLOCK_SIZE:
++	case RNDIS_OID_GEN_MAXIMUM_TOTAL_SIZE: v = 1558; break;
++	case RNDIS_OID_GEN_VENDOR_ID: v = 0x00ffffff; break;
++	case RNDIS_OID_GEN_VENDOR_DRIVER_VERSION: v = 0x00010000; break;
++	case RNDIS_OID_GEN_CURRENT_PACKET_FILTER: v = ud.rndis_filter; break;
++	case RNDIS_OID_GEN_XMIT_OK: v = (uint32_t)ud.tx_frames; break;
++	case RNDIS_OID_GEN_RCV_OK: v = (uint32_t)ud.rx_frames; break;
++	case RNDIS_OID_GEN_VENDOR_DESCRIPTION:
++		memcpy(out, "Sweet iOS", sizeof("Sweet iOS"));
++		*n = (uint32_t)sizeof("Sweet iOS");
++		return RNDIS_STATUS_SUCCESS;
++	case RNDIS_OID_802_3_PERMANENT_ADDRESS:
++	case RNDIS_OID_802_3_CURRENT_ADDRESS:
++		memcpy(out, ud_host_mac, ETHER_ADDR_LEN);
++		*n = ETHER_ADDR_LEN;
++		return RNDIS_STATUS_SUCCESS;
++	case RNDIS_OID_802_3_MULTICAST_LIST:
++		*n = 0;
++		return RNDIS_STATUS_SUCCESS;
++	case RNDIS_OID_802_3_MAXIMUM_LIST_SIZE: v = 32; break;
++	default:
++		*n = 0;
++		ud_rndis_warn("unknown OID", oid);
++		return RNDIS_STATUS_NOT_SUPPORTED;
++	}
++	ud_put_le32(out, v);
++	return RNDIS_STATUS_SUCCESS;
++}
++
++/* One RNDIS control message (len bytes at UD_DATA) from SEND_ENCAPSULATED_COMMAND. */
++static void
++ud_rndis_command(uint32_t len)
++{
++	const uint8_t *m = (const uint8_t *)(ud.dma + UD_DATA);
++	uint32_t type = 0, mlen = 0, id = 0, status = RNDIS_STATUS_SUCCESS;
++	const char *name;
++
++	ud.rsp_len = 0;
++	if (len < 8) {
++		ud_rndis_warn("short command", len);
++		return;
++	}
++	type = ud_get_le32(m);
++	mlen = ud_get_le32(m + 4);
++	if (mlen < 8 || mlen > len) {
++		ud_rndis_warn("bad MessageLength, type", type);
++		return;
++	}
++	if (mlen >= 12) {
++		id = ud_get_le32(m + 8);        /* RequestID (Reserved in RESET) */
++	}
++	name = ud_rndis_name(type);
++	if (name == NULL) {
++		ud_rndis_warn("unknown message type", type);
++		return;
++	}
++	if (!(ud_rndis_logged & (1u << type))) {
++		ud_rndis_logged |= 1u << type;
++		printf("SWEET USB: rndis %s, %u bytes\n", name, mlen);
++	}
++	switch (type) {
++	case RNDIS_INIT:
++		if (mlen < 24) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		ud_rsp_hdr(RNDIS_INIT | RNDIS_COMPLETION, 52, id);
++		ud_put_le32(ud_rsp + 12, RNDIS_STATUS_SUCCESS);
++		ud_put_le32(ud_rsp + 16, 1);            /* MajorVersion */
++		ud_put_le32(ud_rsp + 20, 0);            /* MinorVersion */
++		ud_put_le32(ud_rsp + 24, 1);            /* DeviceFlags: connectionless */
++		ud_put_le32(ud_rsp + 28, 0);            /* Medium: 802.3 */
++		ud_put_le32(ud_rsp + 32, 1);            /* MaxPacketsPerTransfer */
++		ud_put_le32(ud_rsp + 36, 1580);         /* MaxTransferSize */
++		ud_put_le32(ud_rsp + 40, 0);            /* PacketAlignmentFactor */
++		ud_put_le32(ud_rsp + 44, 0);            /* AFListOffset */
++		ud_put_le32(ud_rsp + 48, 0);            /* AFListSize */
++		break;
++	case RNDIS_HALT:
++		if (mlen < 12) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		/* no response: the host is done, the link goes down */
++		ud.rndis_filter = 0;
++		if (ud.rndis_up) {
++			ud.rndis_up = false;
++			ud_link_event(false);
++		}
++		break;
++	case RNDIS_QUERY: {
++		uint32_t n = 0;
++		if (mlen < 28) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		status = ud_oid_get(ud_get_le32(m + 12), ud_rsp + 24, &n);
++		ud_rsp_hdr(RNDIS_QUERY | RNDIS_COMPLETION, 24 + n, id);
++		ud_put_le32(ud_rsp + 12, status);
++		ud_put_le32(ud_rsp + 16, n);            /* InformationBufferLength */
++		ud_put_le32(ud_rsp + 20, 16);           /* data at 8 + 16 = byte 24 */
++		break;
++	}
++	case RNDIS_SET: {
++		uint32_t oid, ilen, ioff;
++		if (mlen < 28) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		oid = ud_get_le32(m + 12);
++		ilen = ud_get_le32(m + 16);
++		ioff = ud_get_le32(m + 20);
++		status = RNDIS_STATUS_NOT_SUPPORTED;
++		if ((uint64_t)8 + ioff + ilen > mlen) {
++			status = RNDIS_STATUS_INVALID_DATA;
++		} else if (oid == RNDIS_OID_GEN_CURRENT_PACKET_FILTER) {
++			if (ilen < 4) {
++				status = RNDIS_STATUS_INVALID_LENGTH;
++			} else {
++				ud.rndis_filter = ud_get_le32(m + 8 + ioff);
++				status = RNDIS_STATUS_SUCCESS;
++				if (ud.rndis_filter != 0 && !ud.rndis_up) {
++					/* the host is ready: report the link up once */
++					ud.rndis_up = true;
++					ud_link_event(true);
++				}
++			}
++		} else if (oid == RNDIS_OID_802_3_MULTICAST_LIST) {
++			status = RNDIS_STATUS_SUCCESS;
++		} else {
++			ud_rndis_warn("unsupported SET OID", oid);
++		}
++		ud_rsp_hdr(RNDIS_SET | RNDIS_COMPLETION, 16, id);
++		ud_put_le32(ud_rsp + 12, status);
++		break;
++	}
++	case RNDIS_RESET:
++		if (mlen < 12) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		ud_rsp_hdr(RNDIS_RESET | RNDIS_COMPLETION, 16, RNDIS_STATUS_SUCCESS);
++		ud_put_le32(ud_rsp + 12, 1);            /* AddressingReset */
++		break;
++	case RNDIS_KEEPALIVE:
++		if (mlen < 12) {
++			ud_rndis_warn("short message", type);
++			break;
++		}
++		ud_rsp_hdr(RNDIS_KEEPALIVE | RNDIS_COMPLETION, 16, id);
++		ud_put_le32(ud_rsp + 12, RNDIS_STATUS_SUCCESS);
++		break;
++	default:
++		break;
+ 	}
+ }
+ 
++/* RESPONSE_AVAILABLE on the interrupt endpoint: 8 bytes, le32 1 and le32 0. */
++static void
++ud_rndis_notify(void)
++{
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	if (!ud.configured || ud.xfer_active[EP_INT]) {
++		return;         /* the previous notification is not read yet */
++	}
++	bzero(n, 8);
++	n[0] = 0x01;            /* le32 1 = RESPONSE_AVAILABLE, then le32 0 (Linux f_rndis) */
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++/* RNDIS_PACKET_MSG in a received transfer: the frame is at 8 + DataOffset, DataLength bytes. */
++static bool
++ud_rndis_frame(uint32_t len, uint32_t *off, uint32_t *flen)
++{
++	const uint8_t *rx = (const uint8_t *)(ud.dma + UD_RX);
++	if (len < 16 || ud_get_le32(rx) != RNDIS_PACKET) {
++		return false;
++	}
++	uint64_t doff = ud_get_le32(rx + 8);
++	uint64_t dlen = ud_get_le32(rx + 12);
++	if (8 + doff + dlen > len || dlen < ETHER_HDR_LEN || dlen > ETHER_MAX_LEN) {
++		return false;
++	}
++	*off = (uint32_t)(8 + doff);
++	*flen = (uint32_t)dlen;
++	return true;
++}
++
+ /* ---- network interface (ue0) ---- */
+ 
+ static void
+@@ -501,6 +868,19 @@
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	uint32_t off = 0;               /* the frame: len bytes at UD_RX + off */
++	if (ud.rndis) {
++		uint32_t flen = 0;
++		if (!ud_rndis_frame(len, &off, &flen)) {
++			ud.rx_bad++;
++			if (ud.rx_bad <= 3) {
++				printf("SWEET USB: rndis malformed packet dropped (%u bytes, %u so far)\n", len, ud.rx_bad);
++			}
++			ud_rx_arm();
++			return;
++		}
++		len = flen;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+@@ -512,7 +892,7 @@
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+ 			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX + off), len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -544,16 +924,29 @@
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		/* RNDIS: the frame follows a 44-byte RNDIS_PACKET_MSG header (DataOffset 36) */
++		size_t hdr = ud.rndis ? RNDIS_PKT_HDR : 0;
++		uint8_t *tx = (uint8_t *)(ud.dma + UD_TX);
++		if (ud.rndis) {
++			bzero(tx, RNDIS_PKT_HDR);
++			ud_put_le32(tx, RNDIS_PACKET);
++			ud_put_le32(tx + 8, RNDIS_PKT_HDR - 8);
++			ud_put_le32(tx + 12, (uint32_t)len);
++		}
++		mbuf_copydata(m, 0, len, tx + hdr);
+ 		mbuf_freem(m);
+-		/* A frame of a multiple of 512 bytes would need a zero-length
++		size_t total = hdr + len;
++		/* A transfer of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		if ((total % 512) == 0) {
++			tx[total++] = 0;
++		}
++		if (ud.rndis) {
++			ud_put_le32(tx + 4, (uint32_t)total);       /* MessageLength, pad included */
+ 		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)total, TRBCTL_NORMAL);
+ 	}
+ }
+ 
+@@ -739,6 +1132,10 @@
+ 		ud_link_event(false);
+ 	}
+ 	ud.data_alt = 0;
++	ud.rndis_up = false;
++	ud.rndis_filter = 0;
++	ud.rsp_len = 0;
++	ud.rndis_cmd = false;
+ }
+ 
+ static void
+@@ -806,6 +1203,14 @@
+ 			ud_setup();
+ 			break;
+ 		case EP0_DATA:
++			if (ud.rndis_cmd) {
++				ud.rndis_cmd = false;
++				ud_sync(UD_DATA, UD_RNDIS_MAX);
++				ud_rndis_command(ud.rndis_len);
++				if (ud.rsp_len) {
++					ud_rndis_notify();
++				}
++			}
+ 			ud.state = EP0_WAIT_STATUS3;
+ 			break;
+ 		case EP0_STATUS:
+@@ -876,7 +1281,7 @@
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured) {
++		if (!ud.configured || (ud.rndis && !ud.rndis_up)) {
+ 			continue;
+ 		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+@@ -899,11 +1304,12 @@
+ }
+ 
+ static void
+-sweet_usb_gadget_start(vm_offset_t dwc)
++sweet_usb_gadget_start(vm_offset_t dwc, bool rndis)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	ud.rndis = rndis;
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
