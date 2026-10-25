@@ -1,0 +1,110 @@
+SWEET/venus: sandbox extension issue/consume succeed (fake token).
+tccd cannot grant kTCCServicePhotos without a sandbox extension, so assetsd
+aborts with "assetsd requires TCCPhotosService access". Extension issue (5)
+now writes a well-formed token (zero hash, then the class) and consume (6)
+returns a positive handle. Nothing is enforced. Container paths (4, 0x43)
+still fail with ENOENT. Applies after 0064 (sweet_amfi.c chain 0025, 0035,
+0036, 0050, 0064).
+
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -279,14 +279,80 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * launchd reports mach lookups as "error = 159: Sandbox restriction"
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+- * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * (checks allow, profile init is accepted). Extension issue and consume
++ * succeed with a fake token: nothing is enforced, but tccd must be able to
++ * grant e.g. kTCCServicePhotos or assetsd aborts ("requires TCCPhotosService
++ * access"). Container paths still fail with ENOENT. The first use of each
++ * operation number is logged.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++static int64_t sweet_sandbox_ext_handle;
++static int sweet_sandbox_ext_issued;
++
++/*
++ * Extension issue: the token is well-formed (64 hex digits of hash, then the
++ * fields libsystem_sandbox parses, then the class) but its hash is zero.
++ */
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_ext_issue(struct proc *p, user_addr_t arg)
++{
++	struct {
++		uint64_t ext_class;     /* user char * */
++		uint64_t a1;
++		uint64_t path;          /* user char *, may be 0 */
++		uint64_t flags;
++		uint64_t out_buf;       /* user buffer, 2048 bytes */
++		uint64_t a5;
++		uint64_t a6;
++	} req;
++	int error = copyin(arg, &req, sizeof(req));
++	if (error != 0) {
++		return error;
++	}
++	char cls[128];
++	size_t done = 0;
++	if (copyinstr(req.ext_class, cls, sizeof(cls), &done) != 0) {
++		strlcpy(cls, "unknown", sizeof(cls));
++	}
++	for (char *c = cls; *c != '\0'; c++) {
++		if (*c == ';') {
++			*c = '_';
++		}
++	}
++	char tok[256];
++	snprintf(tok, sizeof(tok),
++	    "%064x;00;00000000;00000000;00000000;0000000000000000;%s;01;00000000;0000000000000000;",
++	    0, cls);
++	error = copyout(tok, req.out_buf, strlen(tok) + 1);
++	if (error == 0 && sweet_sandbox_ext_issued < 16) {
++		sweet_sandbox_ext_issued++;
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET Sandbox: %s issued %s\n", name, cls);
++	}
++	return error;
++}
++
++/* Extension consume: any token is accepted; the handle is a positive counter. */
++static int
++sweet_sandbox_ext_consume(user_addr_t arg)
++{
++	struct {
++		uint64_t token;         /* user char * */
++		uint64_t token_len;
++		uint64_t out_handle;    /* user int64_t * */
++	} req;
++	int error = copyin(arg, &req, sizeof(req));
++	if (error != 0) {
++		return error;
++	}
++	int64_t handle = __atomic_add_fetch(&sweet_sandbox_ext_handle, 1, __ATOMIC_RELAXED);
++	return copyout(&handle, req.out_handle, sizeof(handle));
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -296,10 +361,12 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
++	case 5:         /* extension issue */
++		return sweet_sandbox_ext_issue(p, arg);
++	case 6:         /* extension consume */
++		return sweet_sandbox_ext_consume(arg);
+ 	default:
+ 		return 0;
+ 	}
