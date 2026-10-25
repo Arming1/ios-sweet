@@ -378,11 +378,13 @@ def palette_payload(raw):
     return bytes(pal)
 
 
-def ffmpeg_frames(ffmpeg, path, fps, w, h, fmt, loops):
+def ffmpeg_frames(ffmpeg, path, fps, w, h, fmt, loops, rotate=0):
     """Yields (frame bytes, palette payload or None) for every frame ffmpeg writes."""
-    vf = "fps=%g,scale=%d:%d:flags=lanczos" % (fps, w, h)
+    # transpose=1: 90 deg clockwise, transpose=2: 90 deg counter-clockwise (landscape clips on a portrait screen)
+    rot = {0: "", 90: "transpose=1,", 270: "transpose=2,"}[rotate]
+    vf = "%sfps=%g,scale=%d:%d:flags=lanczos" % (rot, fps, w, h)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error",
-           "-stream_loop", str(loops - 1), "-i", path, "-vf", vf, "-f", "rawvideo"]
+           "-stream_loop", str(loops - 1), "-i", path, "-map", "0:v:0", "-vf", vf, "-f", "rawvideo"]
     if fmt == "rgb565":
         cmd += ["-pix_fmt", "rgb565le"]
         frame_len = w * h * 2
@@ -516,7 +518,7 @@ def cmd_play(api, args):
         return 1
     w, h = args.size
     dev = Device(api, path)
-    frames = ffmpeg_frames(ffmpeg, args.play, args.fps, w, h, args.format, args.loop)
+    frames = ffmpeg_frames(ffmpeg, args.play, args.fps, w, h, args.format, args.loop, args.rotate)
     try:
         return stream(dev, frames, w, h, args.format, args.fps, END_ACTION[args.end])
     finally:
@@ -556,6 +558,8 @@ def main(argv):
                     help="--play/--testpattern picture size WxH (default 360x640, at most 1440x3200)")
     ap.add_argument("--format", choices=("rgb565", "pal8"), default="rgb565",
                     help="--play/--testpattern pixel format (default rgb565)")
+    ap.add_argument("--rotate", type=int, choices=(0, 90, 270), default=0,
+                    help="rotate the clip before scaling (90 = clockwise); --size is the size after rotation")
     ap.add_argument("--end", choices=("hold", "boot"), default="hold",
                     help="--play/--testpattern after the last frame: keep the picture or boot XNU (default hold)")
     ap.add_argument("--loop", type=int, default=1, help="--play: play the file this many times (default 1)")
