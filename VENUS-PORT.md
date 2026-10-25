@@ -28,6 +28,16 @@
 
     --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=0 rootrw=0 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweettouch=1 sweetkeys=0 sweetusb=2 sweetlog=0 ufsroot=persist'
 
+## Custom boot logo (optional)
+The shim can draw an image while it hands over to XNU.
+
+    SHIM_LOGO_IMAGE=/path/to/logo.png shim/build.sh
+
+- `SHIM_LOGO_MAX` (optional): limit for the longer side in pixels, default 400. The logo is drawn at 3x, centred, from row 1000.
+- Requires Python 3 with Pillow.
+- The image and the generated header stay local: `shim/out` is git-ignored. No logo is shipped with the repo.
+- Tip: flat-colour logos compress far better than photos.
+
 ## 与 sweet 不同的值
 | 项目 | sweet | venus |
 | --- | --- | --- |

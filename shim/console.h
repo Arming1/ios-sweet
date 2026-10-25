@@ -21,3 +21,5 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+/* palette-indexed RLE image, (run,index) pairs, drawn centred horizontally at row y0; each pixel as a scale x scale block; clipped to the screen */
+void con_logo(const uint32_t *pal, const uint8_t *rle, uint32_t rle_len, int w, int h, int scale, int y0);

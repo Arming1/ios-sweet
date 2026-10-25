@@ -95,3 +95,25 @@ void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint
 	}
 	row++;
 }
+
+void con_logo(const uint32_t *pal, const uint8_t *rle, uint32_t rle_len, int w, int h, int scale, int y0)
+{
+	int x0 = (FB_W - w * scale) / 2;
+	int x = 0, y = 0;
+	for (uint32_t k = 0; k + 1 < rle_len && y < h; k += 2) {
+		uint32_t c = pal[rle[k + 1]];
+		for (int n = rle[k]; n > 0 && y < h; n--) {
+			int px = x0 + x * scale, py = y0 + y * scale;
+			if (px >= 0 && px + scale <= FB_W && py >= 0 && py + scale <= FB_H)
+				for (int sy = 0; sy < scale; sy++) {
+					volatile uint32_t *p = con_fb + (py + sy) * (FB_STRIDE / 4) + px;
+					for (int sx = 0; sx < scale; sx++)
+						p[sx] = c;
+				}
+			if (++x == w) {
+				x = 0;
+				y++;
+			}
+		}
+	}
+}

@@ -6,6 +6,14 @@ CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra ${EXTRA_CFLAGS:-}"
 mkdir -p out
+# Optional boot logo (VENUS-PORT.md): SHIM_LOGO_IMAGE=/path/to/logo.png generates
+# out/logo/logo.h (never committed) and defines SHIM_LOGO for shim.c.
+if [ -n "${SHIM_LOGO_IMAGE:-}" ]; then
+	[ -f "$SHIM_LOGO_IMAGE" ] || { echo "error: SHIM_LOGO_IMAGE not found: $SHIM_LOGO_IMAGE" >&2; exit 1; }
+	mkdir -p out/logo
+	python3 ../tools/mklogo.py "$SHIM_LOGO_IMAGE" out/logo/logo.h ${SHIM_LOGO_MAX:+--max "$SHIM_LOGO_MAX"}
+	CFLAGS="$CFLAGS -DSHIM_LOGO -Iout/logo"
+fi
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
