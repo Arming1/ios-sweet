@@ -1,0 +1,12 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7436,6 +7436,9 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (sweet_exec_denied(p->p_name)) {
++		/* done: needs an exit reason for every error (it SIGKILLs with it). */
++		signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++		    EXEC_EXIT_REASON_SECURITY_POLICY);
+ 		error = EPERM;
+ 		goto done;
+ 	}
