@@ -117,3 +117,57 @@ void con_logo(const uint32_t *pal, const uint8_t *rle, uint32_t rle_len, int w, 
 		}
 	}
 }
+
+/* one scale x scale block of the framebuffer, top-left at p */
+static inline void video_block(volatile uint32_t *p, int scale, uint32_t c)
+{
+	for (int sy = 0; sy < scale; sy++, p += FB_STRIDE / 4)
+		for (int sx = 0; sx < scale; sx++)
+			p[sx] = c;
+}
+
+/*
+ * Ops as written by tools/mkvideo.py: SKIP (op < 0x80) moves past unchanged
+ * pixels, RUN (0x80..0xbf) writes one index n times, LITERAL (>= 0xc0) writes
+ * n indices. Source pixels are counted in raster order and wrap at w, like
+ * the stream they encode.
+ */
+void con_video_frame(const uint32_t *pal, const uint8_t *ops, const uint8_t *end,
+		     int w, int h, int scale, int x0, int y0)
+{
+	const int row_step = scale * (FB_STRIDE / 4);	/* words per source row */
+	volatile uint32_t *row = con_fb + y0 * (FB_STRIDE / 4) + x0;	/* block at (0, y) */
+	volatile uint32_t *p = row;				/* block at (x, y) */
+	int x = 0, y = 0;
+
+	while (ops < end && y < h) {
+		unsigned op = *ops++;
+		if (op < 0x80) {
+			x += op + 1;
+			while (x >= w) {
+				x -= w;
+				y++;
+				row += row_step;
+			}
+			p = row + x * scale;
+			continue;
+		}
+		uint32_t c = 0;
+		int n = (op & 0x3f) + 1;
+		if (op < 0xc0)
+			c = pal[*ops++];
+		for (; n > 0; n--) {
+			if (op >= 0xc0)
+				c = pal[*ops++];
+			video_block(p, scale, c);
+			if (++x == w) {
+				x = 0;
+				y++;
+				row += row_step;
+				p = row;
+			} else {
+				p += scale;
+			}
+		}
+	}
+}

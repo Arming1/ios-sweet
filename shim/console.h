@@ -23,3 +23,5 @@ void con_hex(const char *label, uint64_t v);
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
 /* palette-indexed RLE image, (run,index) pairs, drawn centred horizontally at row y0; each pixel as a scale x scale block; clipped to the screen */
 void con_logo(const uint32_t *pal, const uint8_t *rle, uint32_t rle_len, int w, int h, int scale, int y0);
+/* one video frame from tools/mkvideo.py ops (ops..end), w x h source pixels, each a scale x scale block with its top-left at (x0, y0); the caller keeps the picture on screen */
+void con_video_frame(const uint32_t *pal, const uint8_t *ops, const uint8_t *end, int w, int h, int scale, int x0, int y0);

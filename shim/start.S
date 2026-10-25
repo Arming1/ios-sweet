@@ -37,14 +37,17 @@ _start:
 #endif
 	mov	x19, x0			/* DTB pointer from ABL */
 	msr	spsel, #1
-	adr	x1, _stack_top
+	adrp	x1, _stack_top
+	add	x1, x1, :lo12:_stack_top
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
 	/* zero .bss */
-	adr	x1, _bss_start
-	adr	x2, _bss_end
+	adrp	x1, _bss_start
+	add	x1, x1, :lo12:_bss_start
+	adrp	x2, _bss_end
+	add	x2, x2, :lo12:_bss_end
 1:	cmp	x1, x2
 	b.hs	2f
 	str	xzr, [x1], #8
@@ -59,7 +62,8 @@ _start:
 secondary_entry:
 	msr	daifset, #0xf
 	msr	spsel, #1
-	adr	x1, _sec_stacks
+	adrp	x1, _sec_stacks
+	add	x1, x1, :lo12:_sec_stacks
 	add	x1, x1, x0, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1

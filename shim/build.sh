@@ -14,6 +14,18 @@ if [ -n "${SHIM_LOGO_IMAGE:-}" ]; then
 	python3 ../tools/mklogo.py "$SHIM_LOGO_IMAGE" out/logo/logo.h ${SHIM_LOGO_MAX:+--max "$SHIM_LOGO_MAX"}
 	CFLAGS="$CFLAGS -DSHIM_LOGO -Iout/logo"
 fi
+# Optional silent video (SHIM_VIDEO_FILE=/path/to/clip): tools/mkvideo.py writes
+# out/video/video.h (never committed) and defines SHIM_VIDEO for shim.c.
+# SHIM_VIDEO_HOLD=1 selects the hold message (both builds hold for now).
+if [ -n "${SHIM_VIDEO_FILE:-}" ]; then
+	[ -f "$SHIM_VIDEO_FILE" ] || { echo "error: SHIM_VIDEO_FILE not found: $SHIM_VIDEO_FILE" >&2; exit 1; }
+	mkdir -p out/video
+	python3 ../tools/mkvideo.py "$SHIM_VIDEO_FILE" out/video/video.h
+	CFLAGS="$CFLAGS -DSHIM_VIDEO -Iout/video"
+	if [ "${SHIM_VIDEO_HOLD:-0}" = 1 ]; then
+		CFLAGS="$CFLAGS -DSHIM_VIDEO_HOLD=1"
+	fi
+fi
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
 done
