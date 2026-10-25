@@ -1,0 +1,275 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_cpufreq_start(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_cpufreq_start();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,244 @@
++/*
++ * SWEET CPU frequency, venus (SM8350) EPSS cpufreq-hw. Three domains:
++ * D0 0x18591000 cpu0-3 (A55), D1 0x18592000 cpu4-6 (A78), D2 0x18593000 cpu7 (X1).
++ * Layout as in Linux qcom-cpufreq-hw (EPSS): ENABLE +0x0, DOMAIN_STATE +0x20
++ * (bits 7:0 = lval, MHz = lval * 19.2), FREQ_LUT +0x100 (4-byte rows: bits 7:0
++ * lval, bits 31:30 clock source, source 0 = 300 MHz), PERF_STATE +0x320.
++ * ABL leaves D1/D2 at LUT level 0 (710/844 MHz) and D0 at level 12 (1497 MHz).
++ * Only PERF_STATE is ever written, and only when boot-arg sweetcpufreq=a,b,c
++ * is given (decimal levels for D0,D1,D2; 255 or a missing field: unchanged).
++ * The per-cpu benchmark is an estimate: it assumes one loop iteration per cycle.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/processor.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/kern/processor.h, osfmk/kern/sched_prim.h: not exported to the BSD layer */
++extern processor_t cpu_to_processor(int cpu);
++extern processor_t thread_bind(processor_t processor);
++void sweet_cpufreq_start(void);
++
++#define CF_DOMAINS      3
++#define CF_NONE         255
++#define CF_ENABLE       0x00u
++#define CF_DOMAIN_STATE 0x20u
++#define CF_FREQ_LUT     0x100u
++#define CF_PERF_STATE   0x320u
++#define CF_LUT_MAX      40u
++#define CF_BENCH_ITERS  20000000ull
++
++static const vm_offset_t cf_pa[CF_DOMAINS] = {0x18591000u, 0x18592000u, 0x18593000u};
++static uint8_t cf_want[CF_DOMAINS] = {CF_NONE, CF_NONE, CF_NONE};
++static int cf_sleep_chan;
++
++static uint32_t
++cf_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++cf_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&cf_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++cf_park(void)
++{
++	for (;;) {
++		cf_sleep_ms(60000);
++	}
++}
++
++/* Reads LUT rows until a zero row or a repeated frequency; returns the row count. */
++static unsigned
++cf_lut(vm_offset_t b, unsigned *mhz, unsigned max)
++{
++	uint32_t prev = 0;
++	unsigned n = 0;
++	for (unsigned i = 0; i < max; ++i) {
++		uint32_t v = cf_rd(b, CF_FREQ_LUT + 4u * i);
++		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
++		uint32_t khz = src ? 19200u * lval : 300000u;
++		if (v == 0 || (i > 0 && khz == prev)) {
++			break;
++		}
++		prev = khz;
++		mhz[n++] = khz / 1000u;
++	}
++	return n;
++}
++
++/* Spin loop bound to one cpu, best of three runs. Returns MHz at one iteration per cycle. */
++static unsigned
++cf_bench_mhz(int cpu)
++{
++	processor_t target = cpu_to_processor(cpu);
++	processor_t prev;
++	uint64_t best = 0;
++	if (target == NULL) {
++		return 0;
++	}
++	prev = thread_bind(target);
++	thread_block(THREAD_CONTINUE_NULL);
++	for (unsigned run = 0; run < 3; ++run) {
++		uint64_t t0, t1, ns;
++		t0 = mach_absolute_time();
++		__asm__ volatile("mov x9, %[n]\n"
++		    "1:\tsubs x9, x9, #1\n"
++		    "\tb.ne 1b"
++		    :: [n] "r" (CF_BENCH_ITERS) : "x9", "cc", "memory");
++		t1 = mach_absolute_time();
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		if (run == 0 || ns < best) {
++			best = ns;
++		}
++	}
++	thread_bind(prev);
++	thread_block(THREAD_CONTINUE_NULL);
++	return best ? (unsigned)(CF_BENCH_ITERS * 1000ull / best) : 0;
++}
++
++static void
++cf_bench_all(const char *tag, int max_cpu)
++{
++	printf("SWEET CPUFREQ: bench %s\n", tag);
++	for (int cpu = 0; cpu <= max_cpu; ++cpu) {
++		printf("SWEET CPUFREQ: cpu%d %u MHz\n", cpu, cf_bench_mhz(cpu));
++	}
++}
++
++static void
++cf_state_line(const vm_offset_t *base)
++{
++	printf("SWEET CPUFREQ: state d0 %#x d1 %#x d2 %#x perf %u %u %u\n",
++	    cf_rd(base[0], CF_DOMAIN_STATE), cf_rd(base[1], CF_DOMAIN_STATE),
++	    cf_rd(base[2], CF_DOMAIN_STATE),
++	    cf_rd(base[0], CF_PERF_STATE), cf_rd(base[1], CF_PERF_STATE),
++	    cf_rd(base[2], CF_PERF_STATE));
++}
++
++/* "a,b,c": a value of 255 or an empty field leaves that domain unchanged. */
++static void
++cf_parse_args(void)
++{
++	char buf[32] = "";
++	char *p = buf;
++	if (!PE_parse_boot_argn("sweetcpufreq", buf, sizeof(buf))) {
++		return;
++	}
++	buf[sizeof(buf) - 1] = '\0';
++	for (unsigned d = 0; d < CF_DOMAINS && *p != '\0'; ++d) {
++		unsigned v = 0;
++		bool digit = false;
++		for (; *p >= '0' && *p <= '9'; ++p) {
++			v = v < 1000u ? v * 10u + (unsigned)(*p - '0') : v;
++			digit = true;
++		}
++		if (digit && v < CF_NONE) {
++			cf_want[d] = (uint8_t)v;
++		}
++		if (*p != ',') {
++			break;
++		}
++		++p;
++	}
++}
++
++static void
++sweet_cpufreq_thread(void *arg, wait_result_t wr)
++{
++	vm_offset_t base[CF_DOMAINS];
++	unsigned mhz[CF_DOMAINS][CF_LUT_MAX], rows[CF_DOMAINS];
++	int max_cpu = ml_get_max_cpu_number();
++	(void)arg;
++	(void)wr;
++	cf_sleep_ms(15000);
++	for (unsigned d = 0; d < CF_DOMAINS; ++d) {
++		base[d] = ml_io_map(cf_pa[d], 0x1000);
++	}
++	for (unsigned d = 0; d < CF_DOMAINS; ++d) {
++		if (base[d] == 0) {
++			printf("SWEET CPUFREQ: MMIO mapping failed for d%u, cpufreq left alone\n", d);
++			cf_park();
++		}
++	}
++	for (unsigned d = 0; d < CF_DOMAINS; ++d) {
++		uint32_t state = cf_rd(base[d], CF_DOMAIN_STATE);
++		unsigned lo = 0, hi = 0;
++		rows[d] = cf_lut(base[d], mhz[d], CF_LUT_MAX);
++		for (unsigned i = 0; i < rows[d]; ++i) {
++			if (i == 0 || mhz[d][i] < lo) {
++				lo = mhz[d][i];
++			}
++			if (i == 0 || mhz[d][i] > hi) {
++				hi = mhz[d][i];
++			}
++		}
++		printf("SWEET CPUFREQ: d%u en=%#x state=%#x (%u MHz) perf=%u rows=%u lut %u..%u MHz\n",
++		    d, cf_rd(base[d], CF_ENABLE), state, (state & 0xffu) * 19200u / 1000u,
++		    cf_rd(base[d], CF_PERF_STATE), rows[d], lo, hi);
++		for (unsigned i = 0; i < rows[d]; i += 10) {
++			printf("SWEET CPUFREQ: d%u lut", d);
++			for (unsigned j = i; j < rows[d] && j < i + 10; ++j) {
++				printf(" %u", mhz[d][j]);
++			}
++			printf("\n");
++		}
++	}
++	cf_bench_all("before", max_cpu);
++	for (unsigned d = 0; d < CF_DOMAINS; ++d) {
++		unsigned want = cf_want[d];
++		if (want == CF_NONE) {
++			continue;
++		}
++		if (rows[d] == 0) {
++			printf("SWEET CPUFREQ: d%u has no LUT, perf unchanged\n", d);
++			continue;
++		}
++		if (want > rows[d] - 1) {
++			want = rows[d] - 1;
++		}
++		uint32_t old = cf_rd(base[d], CF_PERF_STATE);
++		__asm__ volatile("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(base[d] + CF_PERF_STATE) = want;
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("SWEET CPUFREQ: d%u perf %u -> %u (%u MHz)\n", d, old, want, mhz[d][want]);
++	}
++	cf_sleep_ms(200);
++	cf_state_line(base);
++	cf_bench_all("after", max_cpu);
++	for (unsigned i = 0; i < 20; ++i) {
++		cf_sleep_ms(30000);
++		cf_state_line(base);
++	}
++	cf_park();
++}
++
++void
++sweet_cpufreq_start(void)
++{
++	thread_t thread;
++	cf_parse_args();
++	kern_return_t kr = kernel_thread_start(sweet_cpufreq_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET CPUFREQ: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
