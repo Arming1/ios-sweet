@@ -10,6 +10,7 @@
  *   - the 32MB block(s) holding the image get an L3 table: image pages are
  *     Normal write-back, the rest of the block stays Device
  *   - the splash framebuffer block is Normal non-cacheable (write-combining)
+ *   - optional DMA window inside the image (mmu_set_nc_window): Normal non-cacheable
  */
 #include <stdint.h>
 #include "mmu.h"
@@ -57,12 +58,33 @@ extern char _head[], _end[];
 /* 1 L2 + up to 2 L3 tables, plus slack to align to 16K at runtime */
 static uint64_t pt_pool[4 * NENT] __attribute__((aligned(4096)));
 
-static void dcache_inval_range(uintptr_t start, uintptr_t end)
+/* Data cache line size in bytes (CTR_EL0.DminLine), read on first use. */
+static uintptr_t dcache_line_size(void)
 {
-	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+	static uintptr_t line;
+
+	if (!line)
+		line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+	return line;
+}
+
+/* Lines overlapping [start, end) (VA == PA). Dirty data in them is lost: callers clean first if it matters. */
+void dcache_inval_range(uintptr_t start, uintptr_t end)
+{
+	uintptr_t line = dcache_line_size();
 
 	for (uintptr_t a = start & ~(line - 1); a < end; a += line)
 		__asm__ volatile("dc ivac, %0" : : "r"(a) : "memory");
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* Lines overlapping [start, end): clean (write back) and invalidate, so no dirty line can be evicted later. */
+void dcache_clean_inval_range(uintptr_t start, uintptr_t end)
+{
+	uintptr_t line = dcache_line_size();
+
+	for (uintptr_t a = start & ~(line - 1); a < end; a += line)
+		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
@@ -70,6 +92,15 @@ static void zero_table(uint64_t *t)
 {
 	for (int i = 0; i < NENT; i++)
 		t[i] = 0;
+}
+
+/* Normal non-cacheable pages for DMA: [nc_lo, nc_hi), page aligned. Plain integers, no pointers. */
+static uintptr_t nc_lo, nc_hi;
+
+void mmu_set_nc_window(uintptr_t lo, uintptr_t hi)
+{
+	nc_lo = lo & ~(PG_SIZE - 1);
+	nc_hi = (hi + PG_SIZE - 1) & ~(PG_SIZE - 1);
 }
 
 int mmu_enable(struct mmu_info *info)
@@ -99,7 +130,8 @@ int mmu_enable(struct mmu_info *info)
 		for (int i = 0; i < NENT; i++) {
 			uint64_t pa = base + ((uint64_t)i << PG_SHIFT);
 			int ours = pa >= img_lo && pa < img_hi;
-			l3[i] = pa | (ours ? WB_FLAGS : DEV_FLAGS) | D_PAGE;
+			int dma = pa >= nc_lo && pa < nc_hi;
+			l3[i] = pa | (dma ? NC_FLAGS : ours ? WB_FLAGS : DEV_FLAGS) | D_PAGE;
 		}
 		l2[blk] = (uintptr_t)l3 | D_TABLE;
 	}

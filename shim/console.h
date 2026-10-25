@@ -17,6 +17,9 @@ extern volatile uint32_t *con_fb;
 
 void con_clear(uint32_t bg);
 void con_skip(void);
+/* fixed rows for status lines that are redrawn in place (row 0 is the top) */
+void con_set_row(int r);
+void con_clear_row(int r);	/* background-fill one text row (CH_H pixels high) */
 void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */

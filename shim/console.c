@@ -66,6 +66,21 @@ void con_skip(void)
 	row++;
 }
 
+void con_set_row(int r)
+{
+	row = r;
+}
+
+void con_clear_row(int r)
+{
+	int y0 = MARGIN + r * CH_H;
+	for (int y = y0; y < y0 + CH_H && y < FB_H; y++) {
+		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+		for (int x = 0; x < FB_W; x++)
+			line[x] = con_bg;
+	}
+}
+
 void con_str(const char *label, const char *s)
 {
 	put_str(0, label, YELLOW);
