@@ -1,0 +1,52 @@
+venus: the GPU bring-up's framebuffer write (0099, sweet_gpu_fb_show) mapped the scanout
+buffer a second time with ml_io_map_wcomb(0xE2A00000, 18432000). On the phone that failed
+with kmem_alloc(18432000) failed with 3 (vm_kern.c:178): no kernel VA left. The console
+(pe_serial.c, 0003) already maps the same buffer, so this patch exposes that mapping as
+sweet_fbcon_pixels() and sweet_gpu_fb_show uses it instead. Only the mapping changes;
+the copy is the same. Needs the console's stride to equal SWEET_GPU_FB_STRIDE (5760).
+
+--- a/bsd/dev/sweet_gpu_compat.c
++++ b/bsd/dev/sweet_gpu_compat.c
+@@ -13,8 +13,8 @@
+ #include <pexpert/pexpert.h>
+ #include "sweet_gpu_compat.h"
+ 
+-/* not exported to the BSD layer (osfmk/arm/machine_routines.h), declared as sweet_cpufreq.c does */
+-extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++/* the console's mapping of the scanout buffer (pexpert/arm/pe_serial.c) */
++extern volatile uint32_t *sweet_fbcon_pixels(void);
+ 
+ #define GPU_LINE_MAX    160     /* chars per printed line; gpu_line has one more for the NUL */
+ #define GPU_TL_MAX      256
+@@ -99,11 +99,12 @@ sweet_gpu_fb_show(const void *pixels, unsigned width, unsigned height, unsigned
+ 		return -1;
+ 	}
+ 	if (gpu_fb == NULL) {
+-		vm_offset_t va = ml_io_map_wcomb(SWEET_GPU_FB_PHYS, SWEET_GPU_FB_STRIDE * SWEET_GPU_FB_HEIGHT);
+-		if (va == 0) {
++		volatile uint32_t *px = sweet_fbcon_pixels();
++		if (px == NULL) {
++			printf("SWEET GPU: no console mapping of the framebuffer\n");
+ 			return -1;
+ 		}
+-		gpu_fb = (volatile uint8_t *)va;
++		gpu_fb = (volatile uint8_t *)px;
+ 	}
+ 	/* centred; a picture bigger than the panel is cut from its middle */
+ 	cw = width < SWEET_GPU_FB_WIDTH ? width : SWEET_GPU_FB_WIDTH;
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -717,6 +717,13 @@
+ #define FBCON_BG        0xff000000u
+ 
+ static volatile uint32_t *fbcon_base;
++/* venus: the console's mapping of the scanout buffer, for the GPU bring-up (sweet_gpu_compat.c) */
++volatile uint32_t *sweet_fbcon_pixels(void);
++volatile uint32_t *
++sweet_fbcon_pixels(void)
++{
++	return fbcon_base;
++}
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
