@@ -1,0 +1,15 @@
+venus: GCC debug mux select for the GPU clock controller's output is 0x153 on
+SM8350 (debugcc-lahaina.c:597), not SC7280's 0x146. With the wrong source the
+frequency counter read 0 Hz and step 5 of 0099 stopped (clocks were already set).
+
+--- a/bsd/dev/venus_adreno.c
++++ b/bsd/dev/venus_adreno.c
+@@ -688,7 +688,7 @@
+  * clk-debug.c (mainline Linux has no counterpart).
+  */
+ #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
+-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
++#define GCC_DEBUG_MUX_GPUCC     0x153           /* venus: debugcc-lahaina.c:597 (redwood 0x146); ... the debug output of the GPU's clock controller */
+ #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
+ #define GCC_DEBUG_CBCR          0x62008
+ #define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
