@@ -6,6 +6,9 @@ address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu
                      [--canvas WxH] [--subtype N]
   --canvas WxH  disp0 canvas size iOS renders (default 1125x2436)
   --subtype N   /product artwork-device-subtype (default from the D22AP tree)
+  --fw DIR      add /chosen/sweet-fw: one property per regular file in DIR whose
+                name starts with a660_ (except *.elf; property = raw file bytes), plus
+                "count" (u32). Without --fw the output is unchanged.
 """
 import hashlib, os, re, struct, sys
 
@@ -71,9 +74,10 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, smp=False, canvas=None, subtype=None):
+def build(seed=None, qemu=False, highmem=False, smp=False, canvas=None, subtype=None, fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
-    canvas=(W, H) overrides disp0 canvas-width/height; subtype=N overrides /product artwork-device-subtype."""
+    canvas=(W, H) overrides disp0 canvas-width/height; subtype=N overrides /product artwork-device-subtype.
+    fw=[(name, bytes), ...] adds /chosen/sweet-fw (see fw_files)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     canvas_w, canvas_h = canvas if canvas else (1125, 2436)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -230,6 +234,11 @@ def build(seed=None, qemu=False, highmem=False, smp=False, canvas=None, subtype=
         product_props = [(k, u32(subtype) if k == 'artwork-device-subtype' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
+    # GPU firmware blobs for the kernel (SWEET_FW lookup in sweet_fw.c). Added
+    # last, so every other node keeps its phandle when --fw is given.
+    if fw is not None:
+        chosen.children.append(fw_node(fw, ph))
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
@@ -243,6 +252,35 @@ def build(seed=None, qemu=False, highmem=False, smp=False, canvas=None, subtype=
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+
+
+FW_PREFIX = 'a660_'
+
+
+def fw_files(fw_dir):
+    """[(name, bytes)] for the regular files in fw_dir named a660_*, sorted by name."""
+    if not os.path.isdir(fw_dir):
+        raise SystemExit(f'mkadt.py: --fw {fw_dir!r}: not a directory')
+    names = sorted(n for n in os.listdir(fw_dir)
+                   if n.startswith(FW_PREFIX) and not n.endswith('.elf')
+                   and os.path.isfile(os.path.join(fw_dir, n)))
+    if not names:
+        raise SystemExit(f'mkadt.py: --fw {fw_dir!r}: no {FW_PREFIX}* files')
+    files = []
+    for n in names:
+        # adt.py: name field is 32 bytes incl. NUL; size field is 31 bits (bit 31 = placeholder flag)
+        if len(n.encode()) > 31:
+            raise SystemExit(f'mkadt.py: --fw: property name {n!r} longer than 31 bytes')
+        data = open(os.path.join(fw_dir, n), 'rb').read()
+        if len(data) >= 0x80000000:
+            raise SystemExit(f'mkadt.py: --fw: {n!r} too large for an ADT property')
+        files.append((n, data))
+    return files
+
+
+def fw_node(files, ph):
+    """/chosen/sweet-fw: count (u32) and one raw-bytes property per firmware file."""
+    return node('sweet-fw', [ph(), ('count', u32(len(files)))] + list(files))
 
 
 def flag_value(flag):
@@ -272,10 +310,15 @@ if __name__ == '__main__':
     canvas_arg, subtype_arg = flag_value('--canvas'), flag_value('--subtype')
     canvas = parse_canvas(canvas_arg) if canvas_arg is not None else None
     subtype = parse_subtype(subtype_arg) if subtype_arg is not None else None
+    fw_arg = flag_value('--fw')
+    fw = fw_files(fw_arg) if fw_arg is not None else None
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, smp='--smp' in sys.argv,
-                 canvas=canvas, subtype=subtype)
+                 canvas=canvas, subtype=subtype, fw=fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
         adt.dump(adt.parse(blob)[0])
     print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)
+    if fw is not None:
+        print(f'/chosen/sweet-fw: {len(fw)} files, {sum(len(d) for _, d in fw)} bytes: '
+              + ', '.join(n for n, _ in fw), file=sys.stderr)
