@@ -88,12 +88,13 @@ jobs:
           set -euo pipefail
           cd "$B/mesa-$MESA_VERSION"
           F=src/freedreno/common/freedreno_devices.py
-          if ! grep -q '0x06060001' "$F"; then
-            echo "::error::Mesa $MESA_VERSION has no A660 entry (chip id 0x06060001) in $F"
+          # Mesa lists the A660 as GPUId(660); the kernel reports GPU_ID 660 (and CHIP_ID 0x06060001),
+          # and Mesa matches on the GPU id when both sides have one.
+          if ! grep -q 'GPUId(660)' "$F"; then
+            echo "::error::Mesa $MESA_VERSION has no A660 entry (GPUId(660)) in $F"
             exit 1
           fi
-          # the entry the kernel's CHIP_ID (0x06060001) selects: its GMEM and bank settings are Mesa's
-          grep -n -B3 -A14 '0x06060001' "$F" | head -40
+          grep -n -B3 -A14 'GPUId(660)' "$F" | head -40
 
       - name: Cross file (iphoneos, arm64, iOS 16.0)
         shell: bash
