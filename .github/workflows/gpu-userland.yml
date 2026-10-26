@@ -1,0 +1,246 @@
+# gpu-userland: builds the OpenGL ES user space of the Adreno (Mi 11 "venus", A660) for iOS 16
+# from source: Mesa 25.0.7 (gallium freedreno + softpipe, OSMesa) on a Darwin stand-in for libdrm
+# (userland/mesa/redwood-drm), the EAGL library (libtopaz-gl.dylib), the injection dylib
+# (libtopaz-inject.dylib) and the backboardd wrapper, all for arm64-apple-ios16.0.
+#
+# Credits: the Mesa patches, eagl.c, gl_osmesa.c, topaz_inject.c, bbd_wrap.c come from the Topaz
+# userland (our tree); mkeagl.py and eagl_slots.txt come from HackiOS (MIT, Copyright (c) 2026
+# OOSEX GANG). See userland/CREDITS.md in the repository.
+name: gpu-userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/gpu-userland.yml"
+
+concurrency:
+  group: gpu-userland-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MESA_VERSION: "25.0.7"
+  # the release archive and its digest, as mk-mesa-mac.sh pins them
+  MESA_URL: https://archive.mesa3d.org/mesa-25.0.7.tar.xz
+  MESA_SHA256: 592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
+  # OSMesa links softpipe as its fallback when the GPU is not there (osmesa_target.c), so both
+  MESA_DRIVERS: softpipe,freedreno
+  PREFIX: /topaz
+  IOS_TARGET: arm64-apple-ios16.0
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install bison flex
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet \
+            meson==1.7.2 ninja==1.11.1.4 mako==1.3.10 pyyaml==6.0.2 packaging==24.2
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Fetch Mesa and verify the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/gpu-build"
+          mkdir -p "$B"
+          echo "B=$B" >> "$GITHUB_ENV"
+          cd "$B"
+          curl -fsSL --retry 3 -o "mesa-$MESA_VERSION.tar.xz" "$MESA_URL"
+          echo "$MESA_SHA256  mesa-$MESA_VERSION.tar.xz" | shasum -a 256 -c -
+          tar xJf "mesa-$MESA_VERSION.tar.xz"
+          test -f "mesa-$MESA_VERSION/meson.build"
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # The A660 edit (redwood_drm.c device name) is already applied in the repo's userland/ tree.
+          # Mesa: the Darwin patches of the Topaz tree, in name order (as mk-mesa-mac.sh applies them)
+          cd "$B/mesa-$MESA_VERSION"
+          for p in "$GITHUB_WORKSPACE"/userland/mesa/*.patch; do
+            echo "== $(basename "$p")"
+            patch -p1 -s -C < "$p"
+            patch -p1 -s < "$p"
+          done
+          # the libdrm stand-in: Mesa's freedreno build reaches it as src/redwood-drm
+          rm -rf src/redwood-drm
+          cp -R "$GITHUB_WORKSPACE/userland/mesa/redwood-drm" src/redwood-drm
+
+      - name: Check Mesa's device table has the A660
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$B/mesa-$MESA_VERSION"
+          F=src/freedreno/common/freedreno_devices.py
+          if ! grep -q '0x06060001' "$F"; then
+            echo "::error::Mesa $MESA_VERSION has no A660 entry (chip id 0x06060001) in $F"
+            exit 1
+          fi
+          # the entry the kernel's CHIP_ID (0x06060001) selects: its GMEM and bank settings are Mesa's
+          grep -n -B3 -A14 '0x06060001' "$F" | head -40
+
+      - name: Cross file (iphoneos, arm64, iOS 16.0)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CC="$(xcrun --sdk iphoneos -f clang)"
+          CXX="$(xcrun --sdk iphoneos -f clang++)"
+          cat > "$B/cross.ini" <<INI
+          [binaries]
+          c = ['$CC', '-target', '$IOS_TARGET', '-isysroot', '$SDK']
+          cpp = ['$CXX', '-target', '$IOS_TARGET', '-isysroot', '$SDK', '-fuse-cxa-atexit']
+          objc = ['$CC', '-target', '$IOS_TARGET', '-isysroot', '$SDK']
+          ar = '$(xcrun -f ar)'
+          ranlib = '$(xcrun -f ranlib)'
+          strip = '$(xcrun -f strip)'
+          pkg-config = 'false'
+
+          [host_machine]
+          system = 'darwin'
+          subsystem = 'ios'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          INI
+          cat "$B/cross.ini"
+
+      - name: Configure Mesa
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$B"
+          meson setup build "mesa-$MESA_VERSION" --cross-file cross.ini --wrap-mode=nofallback \
+            --prefix="$PREFIX" --libdir=lib --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Dgallium-drivers="$MESA_DRIVERS" -Dfreedreno-kmds=msm \
+            -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+            -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled \
+            -Dopengl=true -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
+            -Dshader-cache=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled \
+            -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
+            -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false \
+            > meson-setup.log 2>&1 || { tail -80 meson-setup.log; exit 1; }
+
+      - name: Build Mesa (OSMesa, freedreno, softpipe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$B"
+          ninja -C build -j "$(sysctl -n hw.ncpu)" > ninja.log 2>&1 || { grep -n "error" ninja.log | head -60; tail -60 ninja.log; exit 1; }
+          tail -3 ninja.log
+          test -f build/src/gallium/targets/osmesa/libOSMesa.8.dylib
+
+      - name: Assemble /topaz (libOSMesa, gl table, EAGL, injection)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$B/out"
+          T="$OUT/topaz"
+          mkdir -p "$T/lib" "$T/libexec" "$B/obj"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+          echo "T=$T" >> "$GITHUB_ENV"
+          echo "SDK=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "CC=$(xcrun --sdk iphoneos -f clang)" >> "$GITHUB_ENV"
+          # the library, stripped of its local symbols and named the way it is loaded on the phone
+          xcrun strip -x -o "$T/lib/libOSMesa.8.dylib" "$B/build/src/gallium/targets/osmesa/libOSMesa.8.dylib"
+          install_name_tool -id "$PREFIX/lib/libOSMesa.8.dylib" "$T/lib/libOSMesa.8.dylib"
+          nm -gU "$T/lib/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$B/exported-gl.txt"
+          cp "$B/mesa-$MESA_VERSION/src/mapi/glapi/registry/gl.xml" "$B/gl.xml"
+          echo "gl* exported: $(wc -l < "$B/exported-gl.txt")"
+          # the function table of eagl.c, generated from HackiOS's slot list (userland/gpu/mkeagl.py)
+          python3 userland/gpu/mkeagl.py userland/gpu/eagl_slots.txt "$B/gl.xml" "$B/exported-gl.txt" \
+            userland/gpu/eagl.c > "$B/obj/eagl_gen.h"
+          wc -l "$B/obj/eagl_gen.h"
+
+      - name: Compile the dylibs and the wrapper
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          FLAGS=(-target "$IOS_TARGET" -isysroot "$SDK" -O2 -Wall -Wno-unused-function)
+          # libtopaz-gl.dylib: EAGL over OSMesa (eagl.c, gl_osmesa.c). libOSMesa.8.dylib was given its
+          # install name above, before this link, so the library records /topaz/lib/libOSMesa.8.dylib.
+          "$CC" "${FLAGS[@]}" -dynamiclib -install_name "$PREFIX/lib/libtopaz-gl.dylib" \
+            -I"$B/obj" -Iuserland/gpu -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc \
+            "$T/lib/libOSMesa.8.dylib" userland/gpu/eagl.c userland/gpu/gl_osmesa.c \
+            -o "$T/lib/libtopaz-gl.dylib"
+          # libtopaz-inject.dylib: inserted into backboardd (bbd_wrap.c sets DYLD_INSERT_LIBRARIES to it)
+          "$CC" "${FLAGS[@]}" -dynamiclib -install_name "$PREFIX/lib/libtopaz-inject.dylib" \
+            -framework CoreFoundation -framework IOKit -lobjc \
+            userland/gpu/topaz_inject.c -o "$T/lib/libtopaz-inject.dylib"
+          # the backboardd stand-in: put on the phone by hand, never by this workflow
+          "$CC" "${FLAGS[@]}" -o "$T/libexec/backboardd-wrap" userland/gpu/bbd_wrap.c
+
+      - name: Ad-hoc sign and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          # install_name_tool dropped the linker's signature: sign again, ad hoc, no entitlements
+          for f in "$T"/lib/*.dylib "$T"/libexec/backboardd-wrap; do
+            codesign --force --sign - "$f"
+            codesign --verify --strict "$f"
+          done
+          for f in "$T"/lib/*.dylib "$T"/libexec/backboardd-wrap; do
+            echo "== $f"
+            lipo -info "$f"
+            xcrun vtool -show-build "$f" | grep -E "platform|minos" | head -4
+            otool -D "$f" | tail -1
+          done
+          otool -L "$T/lib/libtopaz-gl.dylib" | head -20
+          for f in "$T"/lib/*.dylib; do
+            xcrun vtool -show-build "$f" | grep -q "minos 16.0" || { echo "::error::$f: minos is not 16.0"; exit 1; }
+          done
+
+      - name: Manifest and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "gpu-userland for topaz/venus: the Adreno user space, built from source"
+            echo "mesa: $MESA_VERSION  $MESA_URL"
+            echo "mesa sha256: $MESA_SHA256"
+            echo "mesa drivers: $MESA_DRIVERS (kmds: msm, Darwin stand-in: userland/mesa/redwood-drm)"
+            echo "target: $IOS_TARGET"
+            echo "source commit: $GITHUB_SHA"
+            echo "patches (sha256):"
+            (cd "$GITHUB_WORKSPACE" && shasum -a 256 userland/mesa/*.patch)
+            echo "files (sha256):"
+          } > "$OUT/MANIFEST.txt"
+          (cd "$T" && find . -type f | sort | xargs shasum -a 256) | sed 's|  \./|  /topaz/|' >> "$OUT/MANIFEST.txt"
+          cp "$OUT/MANIFEST.txt" "$T/MANIFEST.txt"
+          COPYFILE_DISABLE=1 tar -czf "$OUT/gpu-userland.tar.gz" -C "$OUT" topaz
+          (cd "$OUT" && shasum -a 256 gpu-userland.tar.gz > gpu-userland.tar.gz.sha256)
+          cat "$OUT/gpu-userland.tar.gz.sha256"
+          tar -tzf "$OUT/gpu-userland.tar.gz"
+          {
+            echo "### gpu-userland"
+            cat "$OUT/gpu-userland.tar.gz.sha256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland
+          path: |
+            ${{ env.OUT }}/gpu-userland.tar.gz
+            ${{ env.OUT }}/gpu-userland.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
