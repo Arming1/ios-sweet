@@ -1689,7 +1689,7 @@ index 0000000..4e60474
 +	return ret;
 +}
 diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
-index 7ec999a..1b22121 100644
+index 76306b9..161bffa 100644
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
 @@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
@@ -1698,5 +1698,5 @@ index 7ec999a..1b22121 100644
  iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
 +iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
  iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEvent.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                    optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
