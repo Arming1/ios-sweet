@@ -2,7 +2,13 @@
 # Build the SWEET iOS root: one case-sensitive HFS+ image holding an iOS OS
 # root filesystem plus its cryptexes, for the userdata partition (rd=ufsroot0).
 #
-#   mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]     (SIZE default 16G)
+#   mkiosroot.sh [--gpu-userland DIR] OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img [SIZE]
+#                                                       (SIZE default 16G)
+#
+# --gpu-userland DIR copies DIR (laid out as /topaz itself: lib/libtopaz-inject.dylib,
+# lib/libOSMesa.8.dylib, ...) into /topaz of the root: root:wheel, files 0644, dirs 0755.
+# The libraries' install names are /topaz/lib/..., so the prefix cannot move. Also
+# creates /private/var/mobile/topaz-logs (mobile) where topaz_inject writes inject.log.
 #
 # The IPSW images are raw APFS with LZBITMAP-compressed files: they are read
 # through apfs-fuse (decompressing), so the HFS+ copy is uncompressed. On a
@@ -18,7 +24,18 @@
 # keybagd reads with /defaults/no-effaceable-storage (tools/mkadt.py).
 set -euo pipefail
 
-[[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }
+gpu=
+while [[ ${1:-} == --* ]]; do
+	case $1 in
+		--gpu-userland) gpu=$(realpath "${2:?--gpu-userland needs a directory}"); shift 2 ;;
+		*) echo "unknown option: $1" >&2; exit 2 ;;
+	esac
+done
+[[ $# -ge 4 ]] || { sed -n '2,24p' "$0"; exit 2; }
+if [[ -n $gpu && ! -d $gpu/lib ]]; then
+	echo "--gpu-userland $gpu: no lib/ directory (the tree is laid out as /topaz)" >&2
+	exit 2
+fi
 os=$(realpath "$1") sysos=$(realpath "$2") appos=$(realpath "$3") out=$4 size=${5:-16G}
 [[ ! -e $out ]] || { echo "refusing to overwrite $out" >&2; exit 1; }
 
@@ -119,6 +136,15 @@ sudo install -d -o 272 -g 272 -m 0755 "$db/uuidtext" "$db/diagnostics/timesync"
 for d in diagnostics uuidtext diagnostics/timesync; do
 	sudo install -o 272 -g 272 -m 0644 /dev/null "$db/$d/.migrated"
 done
+
+# GPU user space (--gpu-userland): loaded into backboardd by dyld when the kernel
+# adds DYLD_INSERT_LIBRARIES (boot-arg sweetinject=/topaz/lib/libtopaz-inject.dylib,backboardd; patch 0103).
+if [[ -n $gpu ]]; then
+	sudo install -d -m 0755 -o 0 -g 0 "$work/root/topaz"
+	sudo rsync -rlt --numeric-ids --chown=0:0 --chmod=D0755,F0644 "$gpu/" "$work/root/topaz/"
+	sudo install -d -m 0755 -o 501 -g 501 "$work/root/private/var/mobile/topaz-logs"
+	echo "gpu user space: $(find "$gpu" -type f | wc -l) files -> /topaz"
+fi
 
 # System keybag for the built-in AppleKeyStore (no passcode).
 sudo install -d -m 0700 -o 0 -g 0 "$work/root/private/var/keybags"

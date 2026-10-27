@@ -26,11 +26,22 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+  removed         the files deleted on the phone with sweetunlink (patch 0091):
+                  PodcastsUsagePlugin, AirFair.syncBundle, and the MobileGestalt
+                  cache (rebuilt from the ADT at the next boot), see REMOVE
 """
 import glob, os, plistlib, shutil, sys
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
+
+# Paths relative to the root. Removed if present; absent is fine (idempotent).
+REMOVE = (
+    'System/Library/PreferenceBundles/StoragePlugins/PodcastsUsagePlugin.bundle/PodcastsUsagePlugin',
+    'System/Library/SyncBundles/AirFair.syncBundle/AirFair',
+    'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/'
+    'Library/Caches/com.apple.MobileGestalt.plist',
+)
 
 
 def load(path):
@@ -122,6 +133,16 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def remove(root):
+    for rel in REMOVE:
+        path = os.path.join(root, rel)
+        if os.path.lexists(path):
+            os.remove(path)
+            print('removed', rel)
+        else:
+            print('absent', rel)
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -130,6 +151,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    remove(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

@@ -1,0 +1,575 @@
+0104-venus-gpu-surfaces: the GPU side of SweetSurface and SweetFramebuffer (topaz merge)
+
+Merged from Topaz's 0901, 0924, 0932, 0937, 0939, 0940, 0942, 0943, 0946, 0948 and 0949 (the
+SweetSurface and SweetFramebuffer parts), onto our 0046-0101 chain. Topaz's 0945 reorder of the
+vsync payload is NOT taken: ours stays (count, time, 0, 0).
+
+Every GPU behaviour is behind the boot-arg sweetgpukeep=1, read once (sweet_gpu_keep() in
+SweetSurface.cpp, declared in SweetSurface.h). Without it the surfaces and the framebuffer behave
+as before this patch:
+  - SweetSurface::free(): the reserve is given back only with the gate on.
+  - sweet_gpu_pool_eligible(): false without the gate (GPU pool surfaces).
+  - SweetSurface create: the contiguous reserve and the physically contiguous path only with the
+    gate; otherwise the plain inTaskWithOptions allocation, as before.
+  - AppleCLCD::start(): RedwoodWaitsForGPU property and publishModes() (TimingElements /
+    ColorElements, 60 Hz) only with the gate.
+  - AppleCLCD::present(): topaz_surface_drawn() only with the gate.
+  - externalMethod selector 79 (kSweetFBGetBlock): only with the gate; without it the selector
+    takes the default path as before.
+  - sweetfps=1 (SWEET FPS line, topaz 0946) keeps its own boot-arg and is not a GPU gate.
+
+Header: SweetSurface.h defines SWEET_TOPAZ_GPU 1 (so the GPU code is compiled) and adds the
+fields RedwoodGPU.cpp reads: drawn, gpuPool, scanoutPhys, poolSize, wrapped (false), wrapDelta
+(0), scanoutSlot (-1).
+
+Not ported: topaz 0901 topaz_adreno_init (venus GPU bring-up is venus_adreno.c), 0092/0099/0100
+scanout and hold structures, 0933/0944/0945 direct presenter, 0941 vsync follow.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4891719..3c90175 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -62,6 +62,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -83,6 +84,16 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++static uint64_t sweet_fps_tick;         /* topaz 0943: mach time of the last vsync tick (SWEET FPS) */
++
++#if defined(SWEET_TOPAZ_GPU)
++/*
++ * venus 0104: the GPU symbol the framebuffer calls (RedwoodGPU.cpp, topaz 0901). topaz_adreno_init
++ * (topaz 0901) is not ported: the venus GPU bring-up is venus_adreno.c, started by sweetgpukeep.
++ */
++bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);
++#endif
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -99,6 +110,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void publishModes(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -236,6 +248,10 @@ AppleCLCD::start(IOService *provider)
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	if (sweet_gpu_keep()) {                                    /* venus 0104: only with sweetgpukeep=1 */
++		setProperty("RedwoodWaitsForGPU", true);               /* topaz 0902: eagl's present() waits for the GPU */
++		publishModes();                                        /* topaz 0948: the modes CoreAnimation reads */
++	}
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -251,6 +267,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	sweet_fps_tick = now;                                      /* topaz 0943 (SWEET FPS): a store only */
++	/* venus 0104: the vsync payload keeps the venus order (topaz 0945's reorder is dropped) */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -298,6 +316,75 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
++/*
++ * The display's modes, the way CoreAnimation reads them (properties TimingElements and
++ * ColorElements; the current one is block 0x40 of selector 79): one timing, the presented size
++ * at 60 Hz, one colour mode, 8-bit RGB. Without them CoreAnimation ran its frame clock at a rate
++ * of its own guessing: 20 frames a second, 50 ms apart. (After HackiOS MiniIOMobileFramebuffer
++ * publishModes(), APSL 2.0.)
++ */
++#define SWEET_FB_TIMING_ID      1
++#define SWEET_FB_COLOR_ID       1
++
++static void
++sweet_set_number(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = 60u << 16;        /* 16.16 */
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		sweet_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_set_number(color, "PixelEncoding", 0);
++		sweet_set_number(color, "Depth", 8);
++		sweet_set_number(color, "Colorimetry", 1);
++		sweet_set_number(color, "EOTF", 1);
++		sweet_set_number(color, "DynamicRange", 0);
++		sweet_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_set_number(horizontal, "Active", fLogicalW);
++		sweet_set_number(horizontal, "Total", fLogicalW);
++		sweet_set_number(horizontal, "SyncRate", rate);
++		sweet_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_set_number(vertical, "Active", fLogicalH);
++		sweet_set_number(vertical, "Total", fLogicalH);
++		sweet_set_number(vertical, "SyncRate", rate);
++		sweet_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		IOLog("SWEET FB: modes published: %ux%u at 60 Hz\n", fLogicalW, fLogicalH);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -328,6 +415,60 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * venus-merge: topaz 0942/0943/0946 (SWEET FPS line, boot-arg sweetfps=1 only). Frames reaching
++ * swap(): how many a second, the longest gap, how many came more than 20 ms after the one before,
++ * and how long after the vsync tick they came. Topaz's "latch wait" term is not ported (it
++ * measures the direct path 0933, which is not in this merge).
++ */
++static uint64_t sweet_fps_after_ns;
++
++static void
++sweet_fps_count(void)
++{
++	static int on = -1;
++	if (on < 0) {
++		uint32_t v = 0;
++		on = PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0;
++	}
++	if (!on) {
++		return;
++	}
++	static uint64_t last, window, gap_max;
++	static uint32_t frames, late;
++	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
++
++	if (last != 0) {
++		absolutetime_to_nanoseconds(now - last, &gap);
++	}
++	last = now;
++	if (window == 0 || gap > 500000000ull) {
++		window = now;
++		frames = late = 0;
++		gap_max = 0;
++		sweet_fps_after_ns = 0;
++		return;
++	}
++	frames++;
++	late += gap > 20000000ull;
++	if (sweet_fps_tick != 0 && now > sweet_fps_tick) {
++		uint64_t after = 0;
++		absolutetime_to_nanoseconds(now - sweet_fps_tick, &after);
++		sweet_fps_after_ns += after;
++	}
++	gap_max = gap > gap_max ? gap : gap_max;
++	absolutetime_to_nanoseconds(now - window, &ns);
++	if (ns >= 1000000000ull) {
++		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame came %llu us after the tick\n",
++		    frames, ns / 1000000, gap_max / 1000000, late,
++		    frames ? sweet_fps_after_ns / 1000 / frames : 0);
++		sweet_fps_after_ns = 0;
++		window = now;
++		frames = late = 0;
++		gap_max = 0;
++	}
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -338,6 +479,7 @@ static uint64_t sweet_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	sweet_fps_count();                                         /* venus-merge: topaz 0942 */
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+@@ -386,6 +528,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++#if defined(SWEET_TOPAZ_GPU)
++		if (sweet_gpu_keep()) {                                /* venus 0104: only with sweetgpukeep=1 */
++			(void)topaz_surface_drawn(s, 100);                 /* topaz 0901: the GPU drew this surface */
++		}
++#endif
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+@@ -558,6 +705,20 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBGetBlock:
++		/*
++		 * Block 0x40, the current mode: its colour and timing identifiers (publishModes). Zeros
++		 * here left CoreAnimation without a mode, and its frame clock without the rate.
++		 */
++		if (sweet_gpu_keep() && args->structureOutput != NULL && args->structureOutputDescriptor == NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			return kIOReturnSuccess;
++		}
++		break;
+ 	case kSweetFBNotifications:
+ 		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
+ 			uint32_t type = (uint32_t)args->scalarInput[2];
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..4415eab 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,9 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#if defined(SWEET_TOPAZ_GPU)
++#include <pexpert/pexpert.h>            /* venus 0104: PE_parse_boot_argn for sweetgpukeep (sweet_gpu_keep) */
++#endif
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -75,6 +78,124 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++#if defined(SWEET_TOPAZ_GPU)
++/*
++ * venus 0104: the one runtime gate of every GPU behaviour in the surfaces and the framebuffer.
++ * Boot-arg sweetgpukeep=1 (read once) turns it on; absent or 0 is the plain surfaces' behaviour.
++ */
++bool
++sweet_gpu_keep(void)
++{
++	static int keep = -1;
++	if (keep < 0) {
++		uint32_t on = 0;
++		keep = PE_parse_boot_argn("sweetgpukeep", &on, sizeof(on)) && on != 0;
++	}
++	return keep != 0;
++}
++
++/*
++ * venus 0104: GPU-side helpers from topaz 0925 (extern decls), 0949 (reserve of contiguous
++ * buffers for screen-sized surfaces). The GPU layer itself (topaz_gpu_pool_*, TopazAdreno.cpp)
++ * is NOT ported: this whole block is compiled only with SWEET_TOPAZ_GPU.
++ */
++extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
++extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++
++/*
++ * venus-merge: our default logical size is 1125x2436 (11 MB BGRA), but sweetfb_size (ours, 0091)
++ * allows up to 1440x3200: 18,432,000 bytes, +64 guard rows = 18,800,640. Topaz's limits
++ * (12 MB reserve, 16 MB contiguous) only cover 1125x2436, so they are raised here.
++ */
++#define SWEET_GPU_CONTIG_MAX            (24u << 20)
++#define SWEET_RES_SIZE                  (20u << 20)
++#define SWEET_RES_COUNT                 4       /* venus-merge: topaz uses 10 x 12 MB */
++static IOBufferMemoryDescriptor *sweet_res_free[SWEET_RES_COUNT];  /* sweet_surface_lock */
++/* freed while something still held the memory (a mapping, the GPU): ours again once it lets go */
++static IOBufferMemoryDescriptor *sweet_res_wait[2 * SWEET_RES_COUNT];
++
++static void
++sweet_res_fill(void)
++{
++	static bool filled;
++	IOBufferMemoryDescriptor *mem[SWEET_RES_COUNT];
++	unsigned n = 0;
++
++	if (filled) {
++		return;
++	}
++	filled = true;
++	for (; n < SWEET_RES_COUNT; n++) {
++		mem[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, SWEET_RES_SIZE,
++		    0x0000000FFFFFC000ull);
++		if (mem[n] == NULL) {
++			break;
++		}
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < n; i++) {
++		sweet_res_free[i] = mem[i];
++	}
++	IOLockUnlock(sweet_surface_lock);
++	IOLog("SWEET SURF: %u contiguous buffers of %u MB set aside for screen-sized surfaces\n", n, SWEET_RES_SIZE >> 20);
++}
++
++static IOBufferMemoryDescriptor *
++sweet_res_take(uint64_t size)
++{
++	IOBufferMemoryDescriptor *mem = NULL;
++
++	if (size > SWEET_RES_SIZE) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < SWEET_RES_COUNT && mem == NULL; i++) {
++		if (sweet_res_free[i] != NULL) {
++			mem = sweet_res_free[i];
++			sweet_res_free[i] = NULL;
++		}
++	}
++	for (unsigned i = 0; i < 2 * SWEET_RES_COUNT && mem == NULL; i++) {
++		if (sweet_res_wait[i] != NULL && sweet_res_wait[i]->getRetainCount() == 1) {
++			mem = sweet_res_wait[i];
++			sweet_res_wait[i] = NULL;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return mem;
++}
++
++static bool
++sweet_res_give(IOMemoryDescriptor *md)
++{
++	IOBufferMemoryDescriptor *mem = OSDynamicCast(IOBufferMemoryDescriptor, md);
++	bool kept = false;
++
++	if (mem == NULL || mem->getCapacity() != SWEET_RES_SIZE) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	if (mem->getRetainCount() == 1) {
++		for (unsigned i = 0; i < SWEET_RES_COUNT && !kept; i++) {
++			if (sweet_res_free[i] == NULL) {
++				sweet_res_free[i] = mem;
++				kept = true;
++			}
++		}
++	}
++	for (unsigned i = 0; i < 2 * SWEET_RES_COUNT && !kept; i++) {
++		if (sweet_res_wait[i] == NULL) {
++			sweet_res_wait[i] = mem;        /* (our reference stays: taken again only at retain count 1) */
++			kept = true;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return kept;
++}
++#endif /* SWEET_TOPAZ_GPU */
++
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+ void
+@@ -84,6 +205,15 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++#if defined(SWEET_TOPAZ_GPU)
++	if (gpuPool && memory != NULL) {        /* venus-merge: topaz 0924/0932 (poolSize, not allocSize) */
++		OSSafeReleaseNULL(memory);
++		topaz_gpu_pool_free(scanoutPhys, poolSize);
++	}
++	if (sweet_gpu_keep() && !gpuPool && memory != NULL && sweet_res_give(memory)) {   /* topaz 0949 */
++		memory = NULL;
++	}
++#endif
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -224,6 +354,56 @@ sweet_surface_publish(SweetSurface *s)
+ 	return ok;
+ }
+ 
++#if defined(SWEET_TOPAZ_GPU)
++/*
++ * topaz 0927/0930/0931 (final state: 0931 reverted 0930): only backboardd's own screen-sized
++ * surfaces (the display's frames) come from the GPU pool. venus 0104: only with sweetgpukeep=1
++ * (sweet_gpu_keep); the topaz boot-arg gpu=1 and gpu_fbpool are not read.
++ */
++static bool
++sweet_gpu_pool_eligible(const SweetSurface *s)
++{
++	if (!(sweet_gpu_keep() && s->bytesPerElement == 4 && s->planeCount <= 1 && s->elementWidth == 1 && s->elementHeight == 1 &&
++	    s->width >= 1000 && s->height >= 2000 && s->allocSize <= (48u << 20))) {
++		return false;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	return strcmp(name, "backboardd") == 0;
++}
++
++/*
++ * topaz 0924 + 0932 (venus-merge: helper function, scanoutPhys is the venus-merge field of the
++ * header). Returns success with s->memory still NULL when no pool buffer is free: the ordinary
++ * memory path follows.
++ */
++static IOReturn
++sweet_surface_gpu_pool(SweetSurface *s)
++{
++	void *va = NULL;
++	/* 64 guard rows past the picture: the GPU writes whole tiles (topaz 0932) */
++	uint64_t take = s->allocSize + 64ull * s->bytesPerRow;
++	uint64_t pa = topaz_gpu_pool_alloc(take, &va);
++	IOMemoryDescriptor *md = pa != 0 ? topaz_gpu_pool_md(pa, s->allocSize) : NULL;
++
++	if (md == NULL) {
++		if (pa != 0) {
++			topaz_gpu_pool_free(pa, take);
++		}
++		return kIOReturnSuccess;
++	}
++	s->poolSize = take;
++	for (uint64_t i = 0; i < take; i += 8) {
++		*(volatile uint64_t *)((uint8_t *)va + i) = 0;
++	}
++	s->memory = md;
++	s->gpuPool = true;
++	s->scanoutPhys = pa;
++	s->mapCache = kIOMapDefaultCache;       /* (the descriptor says write-combined) */
++	return sweet_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
++}
++#endif /* SWEET_TOPAZ_GPU */
++
+ SweetSurface *
+ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+     uint32_t bytesPerRow, uint32_t pixelFormat)
+@@ -684,12 +864,44 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++#if defined(SWEET_TOPAZ_GPU)
++	if (ret == kIOReturnSuccess && sweet_gpu_pool_eligible(s)) {   /* venus-merge: topaz 0924 position */
++		ret = sweet_surface_gpu_pool(s);
++	}
++#endif
++	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++#if defined(SWEET_TOPAZ_GPU)
++			/*
++			 * sweetgpukeep=1 (venus 0104; topaz gpu=1, 0901/0937/0939/0940/0949): screen-sized
++			 * surfaces from the reserve of contiguous buffers; others physically contiguous up to
++			 * SWEET_GPU_CONTIG_MAX, so the GPU can bind them as textures. The reserve/contiguous
++			 * size is rounded to whole pages (venus-merge: round_page; topaz uses sweet_round_upage
++			 * of 0140, 4 KB pages). Without the boot-arg this is the plain allocation below.
++			 */
++			bool gpu_low = sweet_gpu_keep();
++			uint64_t take = gpu_low ? round_page(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
++			if (gpu_low) {
++				sweet_res_fill();
++				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {
++					mem = sweet_res_take(take);
++				}
++			}
++			if (mem == NULL && gpu_low && take <= SWEET_GPU_CONTIG_MAX) {
++				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
++				    0x0000000FFFFFC000ull);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
++#else
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++#endif
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..d87e855 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -11,6 +11,13 @@
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
++/*
++ * venus 0104: the GPU code (RedwoodGPU.cpp, the GPU pool, the contiguous reserve) is compiled
++ * in. It runs only when boot-arg sweetgpukeep=1 is set (sweet_gpu_keep(), SweetSurface.cpp);
++ * without it every path is the one of the plain surfaces.
++ */
++#define SWEET_TOPAZ_GPU 1
++
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSObject.h>
+@@ -40,7 +47,25 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	/*
++	 * venus 0104: GPU fields (topaz 0901/0924/0932). The full scanout set of topaz 0092 and the
++	 * client-memory wrap of topaz 0132/0133 are NOT ported: wrapped is always false, wrapDelta
++	 * 0 and scanoutSlot -1, which is what RedwoodGPU.cpp's checks and log lines then see.
++	 */
++	uint64_t                  scanoutPhys;  /* physical address of a GPU pool buffer (topaz 0924), else 0 */
++	bool                      gpuPool;      /* memory from the GPU pool (topaz 0924) */
++	uint64_t                  poolSize;     /* bytes taken from the GPU pool, surface + guard (topaz 0932) */
++	uint32_t                  drawn;        /* last GPU submission naming this surface (topaz 0901) */
++	bool                      wrapped;      /* client memory (topaz 0132): always false here */
++	uint32_t                  wrapDelta;    /* client memory offset (topaz 0132): always 0 here */
++	int32_t                   scanoutSlot;  /* scanout slot (topaz 0092): always -1 here */
++
++	bool init() APPLE_KEXT_OVERRIDE
++	{
++		scanoutPhys = 0; gpuPool = false; poolSize = 0; drawn = 0;
++		wrapped = false; wrapDelta = 0; scanoutSlot = -1;
++		return OSObject::init();
++	}
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -58,6 +83,9 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++/* venus 0104: boot-arg sweetgpukeep=1 (read once, SweetSurface.cpp). */
++bool sweet_gpu_keep(void);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
