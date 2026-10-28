@@ -1,0 +1,108 @@
+venus: keep mode (boot-arg sweetgpukeep=1) starts the GPU bring-up without the waits that only slow it.
+0099 and 0102 start the bring-up thread after a fixed 25 s sleep, and their announcement waits (pause_ms,
+2200 ms after each announcement of the newest step) and the "alive N s" watch (one second per loop) run
+before the RedwoodGPU service is published, which is too late for backboardd's 5 s wait at its start.
+In keep mode the start delay is 0, and pause_ms and watch_seconds are 0; the hardware's own polls and
+settle delays stay. boot-arg sweetgpudelay=<ms> sets the start delay in any mode. When the service is
+published, one line gives the time since the bring-up thread started.
+
+--- a/bsd/dev/sweet_gpu_compat.c
++++ b/bsd/dev/sweet_gpu_compat.c
+@@ -25,6 +25,7 @@ static char gpu_line[GPU_LINE_MAX + 1];
+ static unsigned gpu_line_len;
+ static int gpu_sleep_chan;
+ static volatile uint8_t *gpu_fb;        /* scanout buffer, mapped on first use */
++static uint64_t gpu_start_t0;           /* mach time the bring-up thread started (the "ready" line) */
+ 
+ /* Prints the collected line, empty or not, and starts a new one. */
+ static void
+@@ -164,7 +165,13 @@ sweet_gpu_service_start(void)
+ 	}
+ 	RedwoodGPUStart();
+ 	gpu_service_up = true;
+-	printf("SWEET GPU: RedwoodGPU service started (sweetgpukeep=1)\n");
++	{
++		uint64_t nanos = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - gpu_start_t0, &nanos);
++		printf("SWEET GPU: ready %llu ms after start (RedwoodGPU service published)\n",
++		    (unsigned long long)(nanos / NSEC_PER_MSEC));
++	}
+ 	return 0;
+ }
+ 
+@@ -220,8 +227,9 @@ extern void venus_adreno_start(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ 
+-#define GPU_START_DELAY_MS      25000
++#define GPU_START_DELAY_MS      25000           /* the wait before the bring-up, in any mode but keep */
+ static int gpu_start_chan;
++static uint32_t gpu_start_delay_ms = GPU_START_DELAY_MS;       /* set by sweet_gpu_start() */
+ 
+ static void
+ gpu_start_thread(void *arg, wait_result_t result)
+@@ -230,9 +238,12 @@ gpu_start_thread(void *arg, wait_result_t result)
+ 
+ 	(void)arg;
+ 	(void)result;
+-	clock_interval_to_deadline(GPU_START_DELAY_MS, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&gpu_start_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
++	gpu_start_t0 = mach_absolute_time();
++	if (gpu_start_delay_ms != 0) {
++		clock_interval_to_deadline(gpu_start_delay_ms, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&gpu_start_chan, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ 	venus_adreno_start();
+ 	sweet_gpu_park();
+ }
+@@ -240,18 +251,25 @@ gpu_start_thread(void *arg, wait_result_t result)
+ /*
+  * Starts the GPU bring-up thread when boot-arg sweetgpu is nonzero (the steps up to that number),
+  * or when sweetgpukeep=1 (venus 0102: all steps, the GPU kept, the service started).
++ * The wait before the bring-up is 25 s, except in keep mode (venus 0105: 0 there, the service must
++ * be up early in the boot). Boot-arg sweetgpudelay=<ms> sets the wait in any mode.
+  */
+ void
+ sweet_gpu_start(void)
+ {
+ 	thread_t thread;
+ 	kern_return_t kr;
+-	uint32_t sweet = 0, keep = 0;
++	uint32_t sweet = 0, keep = 0, delay = GPU_START_DELAY_MS;
+ 
+ 	(void)PE_parse_boot_argn("sweetgpukeep", &keep, sizeof(keep));
+ 	if ((!PE_parse_boot_argn("sweetgpu", &sweet, sizeof(sweet)) || sweet == 0) && keep == 0) {
+ 		return;
+ 	}
++	if (keep != 0) {
++		delay = 0;
++	}
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay, sizeof(delay));
++	gpu_start_delay_ms = delay;
+ 	kr = kernel_thread_start(gpu_start_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+--- a/bsd/dev/venus_adreno.c
++++ b/bsd/dev/venus_adreno.c
+@@ -4017,6 +4017,18 @@ venus_adreno_start(void)
+ 		last_step = STEPS;
+ 	}
+ 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
++	if (sweetkeep) {
++		/*
++		 * Keep mode (sweetgpukeep=1) runs at boot and must have its service up in time for the
++		 * system's own start: no waits that exist only so that a human can read the log.
++		 * hold() (after each announcement and, for the newest step, each access) waits for
++		 * pause_ms, and the "alive" watch below waits for watch_seconds; both are 0 here,
++		 * whatever adreno_pause and adreno_watch say. The hardware's own waits stay: the
++		 * sleep_us polls, the counter window of step 6 and the settle delays of step 20.
++		 */
++		pause_ms = 0;
++		watch_seconds = 0;
++	}
+ 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
+ 	}
+ 
