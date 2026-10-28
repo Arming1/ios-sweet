@@ -1,0 +1,256 @@
+0106-venus-gpu-trace: gputrace=1 trace for RedwoodGPU (iokit/Kernel/arm/RedwoodGPU.cpp, the 0102 state).
+Panic on the phone right after "RedwoodGPU: client backboardd (open 1)": "phystokv_range: illegal PA: 0xe0164000"
+(phys base 0x100000000, size 0xfcc00000). This patch prints "GPUTRACE:" lines by printf for each request
+(selector, struct sizes, first scalars), each memory handed out or made (size, flags, first physical
+segment, GPU address), each IOSurface taken, each cache flush (VA and PA) and each command buffer of a
+submission (at most 8 per submission), and stops at 2000 lines. boot-arg gputrace is read once; without
+it the helpers return before any physical-address call, so behaviour is unchanged.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -47,6 +47,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
++extern "C" int printf(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
+ 
+ extern "C" {
+@@ -180,6 +181,24 @@ struct redwood_show {
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+ #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
+ 
++/*
++ * Boot-arg gputrace=1 (venus 0106): "GPUTRACE:" lines by printf (synchronous, to the console) for
++ * each request of a program's (externalMethod), each buffer handed out (clientMemoryForType) or
++ * made (gemNew), each IOSurface taken (surfaceBuffer), each cache flush and each command buffer of
++ * a submission, with physical addresses where there are some. Read once; off runs none of it.
++ * At most GPUTRACE_LINES lines in all.
++ */
++static TUNABLE(uint32_t, gGPUTrace, "gputrace", 0);
++static uint32_t gGPUTraceLines;
++#define GPUTRACE_LINES          2000
++#define GPUTRACE(...) \
++	do { \
++		if (gGPUTrace != 0 && gGPUTraceLines < GPUTRACE_LINES) { \
++			gGPUTraceLines++; \
++			printf("GPUTRACE: " __VA_ARGS__); \
++		} \
++	} while (0)
++
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+ static bool gGPUCached;                         /* boot-arg gpucached=1 */
+@@ -406,6 +425,91 @@ struct gpu_kept {
+ #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+ 
++/* gputrace (venus 0106): the trace helpers; each does nothing, and calls no getPhysicalSegment(), unless gputrace=1. */
++static bool
++gpuTraceOn(void)
++{
++	return gGPUTrace != 0 && gGPUTraceLines < GPUTRACE_LINES;
++}
++
++/* the first up to 4 physical segments of a memory descriptor, one line each */
++static void
++gpuTraceSegments(const char * what, IOMemoryDescriptor * memory)
++{
++	uint64_t offset = 0, total;
++
++	if (!gpuTraceOn() || memory == NULL) {
++		return;
++	}
++	total = memory->getLength();
++	GPUTRACE("%s: %llu bytes\n", what, (unsigned long long) total);
++	for (uint32_t i = 0; i < 4 && offset < total; i++) {
++		IOByteCount length = 0;
++		addr64_t pa = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		GPUTRACE("  segment %u at +%llu: pa %#llx, %llu bytes\n", i, (unsigned long long) offset,
++		    (unsigned long long) pa, (unsigned long long) length);
++		if (length == 0) {
++			break;
++		}
++		offset += length;
++	}
++}
++
++/* a buffer made or kept for a program: its size, flags, handle, the first segment of its memory and the GPU address */
++static void
++gpuTraceMade(const char * how, uint64_t size, uint32_t flags, uint32_t handle, IOMemoryDescriptor * memory, uint64_t address)
++{
++	IOByteCount length = 0;
++	addr64_t pa = 0;
++
++	if (!gpuTraceOn()) {
++		return;
++	}
++	if (memory != NULL) {
++		pa = memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
++	}
++	GPUTRACE("gem new (%s): %llu bytes, flags %#x, handle %u, first segment pa %#llx (%llu bytes), gpu address %#llx\n",
++	    how, (unsigned long long) size, flags, handle, (unsigned long long) pa, (unsigned long long) length,
++	    (unsigned long long) address);
++}
++
++/* an IOSurface taken as a buffer: its ID, size and first segment, before it is used */
++static void
++gpuTraceSurface(SweetSurface * s, uint32_t handle)
++{
++	IOByteCount length = 0;
++	addr64_t pa = 0;
++
++	if (!gpuTraceOn()) {
++		return;
++	}
++	if (s->memory != NULL) {
++		pa = s->memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
++	}
++	GPUTRACE("surface: id %u, %ux%u, allocSize %u, wrapped %u, gpuPool %u, request handle %u, first segment pa %#llx "
++	    "(%llu bytes)\n", (unsigned) s->id, (unsigned) s->width, (unsigned) s->height, (unsigned) s->allocSize,
++	    (unsigned) s->wrapped, (unsigned) s->gpuPool, handle, (unsigned long long) pa, (unsigned long long) length);
++}
++
++/* a cache flush of a submission's buffer: the kernel address it is done by, and the physical address it is at */
++static void
++gpuTraceFlush(uint32_t index, struct gpu_buffer * b)
++{
++	IOByteCount length = 0;
++	addr64_t pa = 0;
++
++	if (!gpuTraceOn()) {
++		return;
++	}
++	if (b->memory != NULL) {
++		pa = b->memory->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
++	}
++	GPUTRACE("submit: flush buffer %u: va %#llx, pa %#llx (%llu contiguous), %llu bytes\n", index,
++	    (unsigned long long)(uintptr_t) b->kernel, (unsigned long long) pa, (unsigned long long) length,
++	    (unsigned long long) b->size);
++}
++
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodGPUUserClient);
+@@ -772,6 +876,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			found->memory = NULL;
+ 			fKeptBytes -= size;
+ 			gGPUStat.given_again++;
++			gpuTraceMade("kept", size, request->flags, request->handle, b->memory, b->address);
+ 			IOLockUnlock(gGPULock);
+ 			if (gGPUKeep == 2) {
+ 				bzero(b->kernel, (size_t) b->size);
+@@ -793,6 +898,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 				b->memory = low;
+ 				b->kernel = (uint8_t *) low->getBytesNoCopy();
+ 				gGPUStat.made++;
++				gpuTraceMade("low", size, request->flags, request->handle, low, b->address);
+ 			}
+ 			IOLockUnlock(gGPULock);
+ 			if (b == NULL) {
+@@ -803,12 +909,15 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		}
+ 		/* else: from the GPU's pool below 4 GiB (contiguous, write-combined) */
+ 		void * va = NULL;
++		GPUTRACE("gem new (pool): asking the pool for %llu bytes\n", (unsigned long long) size);
+ 		uint64_t pa = topaz_gpu_pool_alloc(size, &va);
+ 
+ 		if (pa == 0) {
+ 			IOLog("RedwoodGPU: the GPU pool has no %llu bytes left\n", size);
+ 			return kIOReturnNoMemory;
+ 		}
++		GPUTRACE("gem new (pool): %llu bytes from pool pa %#llx, va %#llx\n",
++		    (unsigned long long) size, (unsigned long long) pa, (unsigned long long)(uintptr_t) va);
+ 		bzero(va, (size_t) size);
+ 		IOMemoryDescriptor * pm = topaz_gpu_pool_md(pa, size);
+ 		IOLockLock(gGPULock);
+@@ -817,6 +926,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			b->memory = pm;
+ 			b->kernel = (uint8_t *) va;
+ 			gGPUStat.made++;
++			gpuTraceMade("pool", size, request->flags, request->handle, pm, b->address);
+ 		} else {
+ 			redwood_gpu_address_free(pa, size);     /* back to the pool */
+ 		}
+@@ -845,6 +955,7 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		b->kernel = (uint8_t *) memory->getBytesNoCopy();
+ 		gGPUStat.made++;
+ 		gGPUStat.making += mach_absolute_time() - began;
++		gpuTraceMade("made", size, request->flags, request->handle, memory, b->address);
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	if (b == NULL) {
+@@ -872,6 +983,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	gpuTraceSurface(s, request->handle);            /* gputrace: before the surface's address is asked for */
+ 	if (s->memory == NULL || s->kernelAddress() == 0) {
+ 		s->release();
+ 		return kIOReturnUnsupported;
+@@ -1049,6 +1161,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			continue;                       /* topaz: GPU pool memory is write-combined: nothing in the cache */
+ 		}
+ 		if (b->surface != NULL) {
++			if (i < 8) {
++				GPUTRACE("submit: buffer %u: surface %u, reading its state\n", i, (unsigned) b->surface->id);
++			}
+ 			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
+ 
+ 			if (seed == b->seed && !b->seen && began - b->pushed < again) {
+@@ -1059,15 +1174,26 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		} else if (!b->seen || !gGPUCached) {
+ 			continue;
+ 		}
++		if (i < 8) {
++			gpuTraceFlush(i, b);            /* gputrace: at most 8 per submission */
++		}
+ 		redwood_gpu_to_memory(b->kernel, b->size);
+ 		gGPUStat.flushed += b->size;
+ 	}
+ 	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
+ 	gGPUStat.flushing += mach_absolute_time() - began;
+ 	gGPUStat.buffers += request->nr_bos;
++	GPUTRACE("submit: %u command buffers in %u buffers\n", request->nr_cmds, request->nr_bos);
+ 	for (uint32_t i = 0; i < request->nr_cmds; i++) {
+ 		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
+ 
++		if (i < 8) {
++			GPUTRACE("submit: command %u: type %u, buffer %u, offset %u, %u bytes, %u relocations, gpu address %#llx, "
++			    "buffer %llu bytes\n", i, cmds[i].type, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size,
++			    cmds[i].nr_relocs, (unsigned long long)(b != NULL ? b->address + cmds[i].submit_offset : 0),
++			    (unsigned long long)(b != NULL ? b->size : 0));
++		}
++
+ 		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
+ 			continue;                               /* the other kinds are for a GPU shared between address spaces */
+ 		}
+@@ -1212,6 +1338,14 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 		    kIOMapWriteCombineCache : 0;
+ 		ret = kIOReturnSuccess;
+ 	}
++	/* gputrace: the memory handed out, before returning it */
++	if (b != NULL) {
++		GPUTRACE("clientMemoryForType: type %u (handle), return %#x, options %#llx, gpu address %#llx\n", type, ret,
++		    (unsigned long long) *options, (unsigned long long) b->address);
++		gpuTraceSegments("clientMemoryForType descriptor", b->memory);
++	} else {
++		GPUTRACE("clientMemoryForType: type %u: no such buffer\n", type);
++	}
+ 	IOLockUnlock(gGPULock);
+ 	return ret;
+ }
+@@ -1239,6 +1373,12 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t zero = 0, patience, waitBegan;
+ 
++	/* gputrace: what the request is, before it is dispatched (the first two scalars, if any) */
++	GPUTRACE("request sel %#x: struct in %llu bytes, out %llu bytes, scalars %u (%#llx %#llx), buffers %u\n", selector,
++	    (unsigned long long) size, (unsigned long long) args->structureOutputSize, (unsigned) args->scalarInputCount,
++	    args->scalarInputCount > 0 ? (unsigned long long) args->scalarInput[0] : 0ull,
++	    args->scalarInputCount > 1 ? (unsigned long long) args->scalarInput[1] : 0ull, fBufferCount);
++
+ 	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
