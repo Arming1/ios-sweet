@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: "macos-14 (Xcode 15 iig) or macos-15 (Xcode 16 + xnu/iig-pregen replay)"
+        default: "macos-14"
   push:
     branches: [main]
     paths:
@@ -22,7 +25,7 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  group: xnu-${{ github.ref }}-${{ inputs.runner || 'macos-14' }}
   cancel-in-progress: true
 
 env:
@@ -36,7 +39,8 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # macos-15 works too: with Xcode 16 the Deps step replays the Xcode 15 iig outputs (xnu/iig-pregen)
+    runs-on: ${{ inputs.runner || 'macos-14' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +69,14 @@ jobs:
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
-          xcrun --find iig
+          XCMAJOR=$(xcodebuild -version | head -1 | awk '{split($2, v, "."); print v[1]}')
+          if [ "$XCMAJOR" -ge 16 ]; then
+            chmod +x "$GITHUB_WORKSPACE/xnu/tools/iig-replay.sh"
+            echo "IIG=$GITHUB_WORKSPACE/xnu/tools/iig-replay.sh" >> "$GITHUB_ENV"
+            echo "Xcode $XCMAJOR: using iig-replay (Xcode 15 iig outputs in xnu/iig-pregen)"
+          else
+            xcrun --find iig
+          fi
 
       - name: Build
         working-directory: dxb
