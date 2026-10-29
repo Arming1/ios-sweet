@@ -1,0 +1,27 @@
+0114-venus-vsync-payload-order: the vsync notification now carries (time of this refresh, time presented, counter) as QuartzCore
+reads it (topaz 0945), not (counter, time, 0): with the counter first CoreAnimation's frame clock took the counter for a time,
+saw every frame as long overdue and scheduled the next one ~150 ms later -- 8-10 frames a second.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -304,11 +304,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 	}
+ 	sweet_fps_tick = now;                                      /* topaz 0943 (SWEET FPS): a store only */
+-	/* venus 0104: the vsync payload keeps the venus order (topaz 0945's reorder is dropped) */
++	/*
++	 * venus 0114: what QuartzCore reads is three 64-bit numbers as six halves -- the time of
++	 * this refresh, the time it was presented, a counter (topaz 0945). The counter came first
++	 * here, and CoreAnimation's frame clock took it for a time: every frame looked ten seconds
++	 * overdue and it scheduled the next one ~150 ms away (8-10 frames a second), however steady
++	 * the 60 Hz timer was.
++	 */
+ 	uint64_t values[6] = {
+-		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)count, (uint32_t)(count >> 32),
+ 	};
+
+ 	IOLockLock(fb->fLock);
