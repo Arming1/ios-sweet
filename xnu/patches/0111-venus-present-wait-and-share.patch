@@ -1,0 +1,88 @@
+0111-venus-present-wait-and-share: AppleCLCD::present() times its topaz_surface_drawn() wait (the first 16 waits of 5 ms or
+more are logged) and boot-arg sweetfbnowait=1 skips it; RedwoodGPUUserClient::surfaceBuffer() sizes the shared range from the
+picture plus 64 guard rows instead of allocSize, so 1440x3200 screen surfaces are shared, and logs why a surface is not shared.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -986,7 +986,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	SweetSurface * s = sweet_surface_copy(request->surface);
+ 	struct gpu_buffer * b = NULL;
+ 	IOMemoryDescriptor * memory;
+-	uint64_t size, began = mach_absolute_time();
++	uint64_t size, picture, want, began = mach_absolute_time();
+
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+@@ -1038,14 +1038,27 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 	 * gpu_identity=0: the SMMU translates, the buffer's pages need not be contiguous. The GPU's
+ 	 * whole tiles past the last row need pages behind them (a fault otherwise): the 64 rows
+ 	 * SweetSurface allocates beyond the picture, when the descriptor has them.
++	 *
++	 * venus 0111: the shared range is the picture plus those 64 guard rows, not allocSize. A
++	 * 1440x3200 screen surface keeps the allocSize of the two-plane b3a8 request (23,150,592)
++	 * after 0108 makes it one-plane BGRA, so allocSize plus 64 rows (23.5 MB) could exceed what
++	 * was allocated and eagl copied the picture up every frame (18 MB). The picture plus the
++	 * guard rows is 18.8 MB and fits, so the GPU can read the surface where it is.
+ 	 */
++	picture = round_page_64((uint64_t)s->bytesPerRow * (uint64_t)s->height);
++	want = round_page_64(picture + 64ull * s->bytesPerRow);
+ 	size = round_page_64(s->allocSize);
+ 	if (!redwood_gpu_identity() && !s->wrapped) {
+ 		IOBufferMemoryDescriptor * bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+-		uint64_t want = round_page_64(s->allocSize + 64ull * s->bytesPerRow);
+-		if (bmd != NULL && bmd->getLength() >= want) {
++		if (bmd != NULL && want != 0 && bmd->getLength() >= want) {
+ 			size = want;
+ 		} else if (!s->gpuPool) {
++			static uint32_t told;
++			if (told++ < 16) {
++				IOLog("RedwoodGPU: surface %u (%ux%u fmt %#x bpr %u alloc %u len %llu) not shared: want %llu\n",
++				    s->id, s->width, s->height, s->pixelFormat, s->bytesPerRow, s->allocSize,
++				    (unsigned long long)s->memory->getLength(), (unsigned long long)want);
++			}
+ 			s->release();
+ 			return kIOReturnUnsupported;
+ 		}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -92,6 +92,20 @@ static uint64_t sweet_fps_tick;         /* topaz 0943: mach time of the last vsy
+  * (topaz 0901) is not ported: the venus GPU bring-up is venus_adreno.c, started by sweetgpukeep.
+  */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);
++
++/* venus 0111: sweetfbnowait=1 skips the wait for the GPU before a surface is shown (a test). */
++static bool
++sweet_fb_present_no_wait(void)
++{
++	static int no_wait = -1;
++
++	if (no_wait < 0) {
++		uint32_t on = 0;
++
++		no_wait = PE_parse_boot_argn("sweetfbnowait", &on, sizeof(on)) && on != 0;
++	}
++	return no_wait != 0;
++}
+ #endif
+
+ class IOMobileFramebuffer : public IOService {
+@@ -529,8 +543,17 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ #if defined(SWEET_TOPAZ_GPU)
+-		if (sweet_gpu_keep()) {                                /* venus 0104: only with sweetgpukeep=1 */
+-			(void)topaz_surface_drawn(s, 100);                 /* topaz 0901: the GPU drew this surface */
++		if (sweet_gpu_keep() && !sweet_fb_present_no_wait()) {   /* venus 0104/0111: only with sweetgpukeep=1 */
++			uint64_t began = mach_absolute_time();
++			bool done = topaz_surface_drawn(s, 100);            /* topaz 0901: the GPU drew this surface */
++			uint64_t ns = 0;
++
++			absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++			static uint32_t told;
++			if (ns >= 5ull * NSEC_PER_MSEC && told++ < 16) {
++				IOLog("SWEET FB: present waited %llu us for surface %u (done %d)\n",
++				    (unsigned long long)(ns / NSEC_PER_USEC), s->id, done ? 1 : 0);
++			}
+ 		}
+ #endif
+ 		uintptr_t src = s->kernelAddress();
