@@ -1,0 +1,21 @@
+0110-venus-zombie-state-only: a released view (zombie) keeps only its state page, not its SweetSurface. trapRelease
+drops the view's retain on the surface (ref->surface = NULL) right after sweet_surface_put, so the pixels are freed
+at the release instead of 256 releases later. Base: state after 0109. Zombies are never in fRefs; free() checks surface != NULL.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1660,6 +1660,14 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 		 */
+ 		OSSafeReleaseNULL(ref->data);
+ 		sweet_surface_put(ref->surface);
++		/*
++		 * venus 0110: the zombie keeps only its state page (ref->state, a mapping that holds the
++		 * page's own descriptor), not the surface: holding the SweetSurface kept its pixels (23 MB
++		 * for a 1440x3200 screen surface) wired until 256 zombies later, and backboardd's GPU path
++		 * ran into SWEET_SURFACE_WIRED_MAX within a minute.
++		 */
++		ref->surface->release();
++		ref->surface = NULL;
+ 		ref->released = true;
+ 		ref->detached = false;
+ 		if (fZombies != NULL && fZombies->setObject(ref)) {
