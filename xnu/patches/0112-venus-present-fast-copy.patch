@@ -1,0 +1,64 @@
+0112-venus-present-fast-copy: AppleCLCD::present() copies a whole-panel layer with one memcpy (the row-by-row copy into the
+write-combined panel memory took ~85 ms and held the vsync timer near 10 Hz), and logs the first 16 presents of 5 ms or more
+with their copy time and layer count.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -507,6 +507,8 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uint64_t began = mach_absolute_time(), copy_ns = 0;
++	uint32_t layers = 0;
+
+
+ 	if (!fConsolePaused) {
+@@ -600,14 +602,44 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			uint64_t copy_began = mach_absolute_time();
++			uint64_t ns = 0;
++
++			/*
++			 * venus 0112: a layer that is the whole panel, row for row, is copied in one go.
++			 * The per-row memcpy into the panel memory took ~85 ms of a present (3200 row
++			 * stores to write-combined memory), and the vsync timer only comes round again
++			 * after present returns, so CoreAnimation's frame clock was held near 10 Hz.
++			 * One 18 MB memcpy is several times faster on the same memory.
++			 */
++			if (!s->wrapped && sx == 0 && sy == 0 && dx == 0 && dy == 0 &&
++			    w == (int32_t)fWidth && h == (int32_t)fHeight && s->bytesPerRow == fRowBytes) {
++				memcpy((void *)fPixels, (const void *)(src + s->offset),
++				    (size_t)fRowBytes * (size_t)fHeight);
++			} else {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
+ 			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - copy_began, &ns);
++			copy_ns += ns;
++			layers++;
+ 		}
+ 		s->release();
+ 	}
++	if (layers != 0) {
++		uint64_t ns = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		static uint32_t told;
++		if (ns >= 5ull * NSEC_PER_MSEC && told++ < 16) {
++			IOLog("SWEET FB: present took %llu us (copy %llu us, %u layers, %ux%u)\n",
++			    (unsigned long long)(ns / NSEC_PER_USEC), (unsigned long long)(copy_ns / NSEC_PER_USEC),
++			    layers, fWidth, fHeight);
++		}
++	}
+ }
+
+ bool
