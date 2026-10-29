@@ -1,0 +1,231 @@
+0109-venus-surface-life-trace: diagnostic only. Boot-arg surftrace=1 (read once) prints "SURFTRACE:" lines for the life of screen-sized
+surfaces (width >= 1000 and height >= 2000): each user taken and given back (SweetSurface.cpp get, put), each client release (trapDetach,
+trapRelease, clientClose), each free, every 2 seconds how many are alive and how much is wired, and the GPU's import, close and reap of
+them (RedwoodGPU.cpp). For the 1440x3200 IOSurface that backboardd makes every frame and never frees (SWEET_SURFACE_WIRED_MAX reached,
+creates fail with 0xe00002bd). One static counter caps the output at 4000 lines. Nothing changes without the boot-arg.
+Base: 0108 (SweetSurface.cpp, with 0107) and the 0106 state of RedwoodGPU.cpp.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -49,6 +49,7 @@
+ extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+ extern "C" int printf(const char * format, ...) __printflike(1, 2);
+ bool topaz_surface_drawn(SweetSurface * surface, uint64_t milliseconds);
++bool sweet_surf_trace_line(void);       /* venus 0109: SweetSurface.cpp; counts a SURFTRACE line, true if it may be printed */
+ 
+ extern "C" {
+ /* bsd/dev/venus_adreno.c ("the GPU kept on"; venus 0102 glue: venus_adreno.c and sweet_gpu_compat.c) */
+@@ -593,6 +594,10 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 	if (busy && fLeftCount == GPU_LEFT) {
+ 		busy = !gpuWait(b->fence, 1000);        /* (nowhere to keep it: this one is waited for) */
+ 	}
++	if (b->surface != NULL && b->surface->width >= 1000 && b->surface->height >= 2000 && sweet_surf_trace_line()) {  /* venus 0109 */
++		printf("SURFTRACE: gpu close id %u handle %u size %llu busy %d\n", b->surface->id,
++		    (unsigned)(b - fBuffers + 1), (unsigned long long)b->size, (int)busy);
++	}
+ 	if (busy && fLeftCount < GPU_LEFT) {
+ 		struct gpu_left * left = &fLeft[fLeftCount++];
+ 
+@@ -647,6 +652,9 @@ RedwoodGPUUserClient::reap(void)
+ 			i++;
+ 			continue;
+ 		}
++		if (left->surface != NULL && left->surface->width >= 1000 && left->surface->height >= 2000 && sweet_surf_trace_line()) {  /* venus 0109 */
++			printf("SURFTRACE: gpu reap id %u\n", left->surface->id);
++		}
+ 		if (left->surface == NULL && redwood_gpu_ready() &&
+ 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
+ 			left->memory = NULL;
+@@ -1071,6 +1079,9 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		}
+ 	}
+ 	if (b != NULL) {
++		if (s->width >= 1000 && s->height >= 2000 && sweet_surf_trace_line()) {     /* venus 0109 */
++			printf("SURFTRACE: gpu import id %u handle %u (again)\n", s->id, request->handle);
++		}
+ 		memory->release();
+ 		s->release();
+ 	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle)) != NULL) {
+@@ -1078,6 +1089,9 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		b->kernel = (uint8_t *) s->kernelAddress();
+ 		b->surface = s;
+ 		gGPUStat.surfaces++;
++		if (s->width >= 1000 && s->height >= 2000 && sweet_surf_trace_line()) {     /* venus 0109 */
++			printf("SURFTRACE: gpu import id %u handle %u (new)\n", s->id, request->handle);
++		}
+ 	}
+ 	gGPUStat.taking += mach_absolute_time() - began;
+ 	IOLockUnlock(gGPULock);
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -44,9 +44,13 @@
+ #include <libkern/c++/OSSerialize.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <kern/clock.h>                 /* venus 0109: the SURFTRACE summary's 2 seconds (nanoseconds_to_absolutetime) */
++#include <kern/startup.h>               /* venus 0109: TUNABLE surftrace */
++#include <mach/mach_time.h>
+ #if defined(SWEET_TOPAZ_GPU)
+ #include <pexpert/pexpert.h>            /* venus 0104: PE_parse_boot_argn for sweetgpukeep (sweet_gpu_keep) */
+ #endif
++extern "C" int printf(const char * format, ...) __printflike(1, 2);     /* venus 0109: SURFTRACE lines */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -98,6 +102,32 @@ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * venus 0109: boot-arg surftrace=1 (read once). "SURFTRACE:" lines by printf for screen-sized
++ * surfaces (width >= 1000 and height >= 2000): each user taken and given back (get, put), each
++ * release by a client, each free, each import, close and reap by the GPU (RedwoodGPU.cpp), and
++ * every 2 seconds how many are alive. At most SURFTRACE_LINES lines in all. Off, nothing is
++ * printed and nothing is counted.
++ */
++static TUNABLE(uint32_t, gSurfTrace, "surftrace", 0);
++static SInt32 gSurfTraceLines;
++#define SURFTRACE_LINES         4000
++
++bool sweet_surf_trace_line(void);
++
++static bool
++sweet_surf_screen(const SweetSurface *s)
++{
++	return s->width >= 1000 && s->height >= 2000;
++}
++
++/* Whether a SURFTRACE line may be printed now: it is counted, so the caller prints it. */
++bool
++sweet_surf_trace_line(void)
++{
++	return gSurfTrace != 0 && OSIncrementAtomic(&gSurfTraceLines) < SURFTRACE_LINES;
++}
++
+ #if defined(SWEET_TOPAZ_GPU)
+ /*
+  * venus 0104: the one runtime gate of every GPU behaviour in the surfaces and the framebuffer.
+@@ -224,6 +254,10 @@ SweetSurface::free()
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
++	if (sweet_surf_screen(this) && sweet_surf_trace_line()) {       /* venus 0109 */
++		printf("SURFTRACE: free id %u alloc %u, wired now %llu MB\n", id, allocSize,
++		    (unsigned long long)(sweet_surface_wired >> 20));
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(values);              /* topaz 0133 */
+ 	if (wrapped && memory != NULL) {        /* topaz 0132: the range prepared by IOSurfaceWrapClient* / IOSurfaceAddress */
+@@ -301,6 +335,11 @@ sweet_surface_get(SweetSurface *s)
+ 	} else {
+ 		ok = false;
+ 	}
++	if (ok && sweet_surf_screen(s) && sweet_surf_trace_line()) {    /* venus 0109 */
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SURFTRACE: get id %u users %u (%s)\n", s->id, sweet_surface_users[s->id], name);
++	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return ok;
+ }
+@@ -315,6 +354,12 @@ sweet_surface_put(SweetSurface *s)
+ 		sweet_surface_table[s->id] = NULL;
+ 		drop = true;
+ 	}
++	/* venus 0109: one user of ours went: the last one (drop), or the table still holds s */
++	if ((drop || sweet_surface_table[s->id] == s) && sweet_surf_screen(s) && sweet_surf_trace_line()) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SURFTRACE: put id %u users %u (%s)\n", s->id, sweet_surface_users[s->id], name);
++	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	if (drop) {
+ 		s->release();
+@@ -378,6 +423,40 @@ sweet_surface_publish(SweetSurface *s)
+ 	return ok;
+ }
+ 
++/*
++ * venus 0109: at most every 2 seconds, how many screen-sized surfaces the table holds and how much
++ * memory is wired (called at the end of create). The count is under the lock.
++ */
++static void
++sweet_surf_summary(void)
++{
++	static uint64_t summary_at;             /* mach_absolute_time from which the next line may come */
++	uint64_t now, gap, wired;
++	uint32_t alive = 0;
++
++	if (gSurfTrace == 0) {
++		return;
++	}
++	now = mach_absolute_time();
++	IOLockLock(sweet_surface_lock);
++	if (now < summary_at) {
++		IOLockUnlock(sweet_surface_lock);
++		return;
++	}
++	nanoseconds_to_absolutetime(2000000000ull, &gap);
++	summary_at = now + gap;
++	for (uint32_t id = 1; id < SWEET_SURFACE_MAX_ID; id++) {
++		if (sweet_surface_table[id] != NULL && sweet_surf_screen(sweet_surface_table[id])) {
++			alive++;
++		}
++	}
++	wired = sweet_surface_wired;
++	IOLockUnlock(sweet_surface_lock);
++	if (sweet_surf_trace_line()) {
++		printf("SURFTRACE: alive screen-sized: %u, wired %llu MB\n", alive, (unsigned long long)(wired >> 20));
++	}
++}
++
+ #if defined(SWEET_TOPAZ_GPU)
+ /*
+  * topaz 0927/0930/0931 (final state: 0931 reverted 0930): only backboardd's own screen-sized
+@@ -700,6 +779,14 @@ IOReturn
+ IOSurfaceRootUserClient::clientClose(void)
+ {
+ 	IOLockLock(fLock);
++	for (unsigned int i = 0; i < fRefs->getCount(); i++) {      /* venus 0109: the views this close gives up */
++		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
++		if (sweet_surf_screen(ref->surface) && sweet_surf_trace_line()) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			printf("SURFTRACE: release id %u by %s (refs left in this client: 0, at close)\n", ref->surface->id, name);
++		}
++	}
+ 	fRefs->flushCollection();
+ 	if (fZombies != NULL) {
+ 		fZombies->flushCollection();
+@@ -1017,6 +1104,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	ret = returnSurface(s, args);   /* takes the creator's user count */
+ 	s->release();
++	sweet_surf_summary();           /* venus 0109 */
+ 	return ret;
+ }
+ 
+@@ -1537,6 +1625,11 @@ IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, vo
+ 	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
+ 	if (ref != NULL) {
+ 		ref->detached = true;
++		if (sweet_surf_screen(ref->surface) && sweet_surf_trace_line()) {       /* venus 0109: count not changed here */
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			printf("SURFTRACE: release id %u by %s (refs left in this client: %u)\n", ref->surface->id, name, ref->count);
++		}
+ 	}
+ 	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+@@ -1551,6 +1644,11 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 	if (ref == NULL) {
+ 		ref = findRef((uint32_t)(uintptr_t)id, &index);
+ 	}
++	if (ref != NULL && sweet_surf_screen(ref->surface) && sweet_surf_trace_line()) {    /* venus 0109 */
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SURFTRACE: release id %u by %s (refs left in this client: %u)\n", ref->surface->id, name, ref->count - 1);
++	}
+ 	if (ref != NULL && --ref->count == 0) {
+ 		/*
+ 		 * The pixels are unmapped now; the state page (read-only) stays mapped a while.
